@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Roll20 HUD
 // @namespace    http://tampermonkey.net/
-// @version      6.82
+// @version      6.97
 // @match        https://app.roll20.net/editor/
 // @grant        none
 // ==/UserScript==
@@ -21,6 +21,12 @@
   const HUD_AC_PREV_MOD_ATTR = 'tm_hud_ac_prev_mod';
   const TOOLTIP_OFFSET_Y = 24;
   const HUD_SHIFT_RIGHT_PERCENT = 15;
+  const TRAIT_SOURCE_OPEN = Object.create(null);
+  const EQUIPMENT_CATEGORY_OPEN = Object.create(null);
+  const SPELL_LEVEL_OPEN = Object.create(null);
+  let SELECTED_TRAIT_KEY = '';
+  let SELECTED_SPELL_KEY = '';
+  let SPELL_SHOW_ALL = localStorage.getItem('tm_spell_show_all') === '1';
 
   /* ================= CHARACTER ================= */
 
@@ -136,6 +142,27 @@
       .replace(/'/g, '&#39;');
   }
 
+  function compactText(value) {
+    return String(value || '')
+      .replace(/\r/g, '')
+      .replace(/\n+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function asMultilineHtml(value) {
+    const text = String(value || '').replace(/\r/g, '').trim();
+    if (!text) return '<span class="tm-detail-empty">Aucune description.</span>';
+    return escapeHtml(text).replace(/\n/g, '<br>');
+  }
+
+  function shortSummary(value, maxLen = 140) {
+    const text = compactText(value);
+    if (!text) return '';
+    if (text.length <= maxLen) return text;
+    return `${text.slice(0, Math.max(0, maxLen - 3)).trim()}...`;
+  }
+
   function button(cmd) {
     const label = LABELS[cmd];
 
@@ -202,6 +229,94 @@
     if (!char) return null;
 
     return `%{${char.get('name')}|${sheetAction}}`;
+  }
+
+  function escapeAttrSelectorValue(value) {
+    return String(value ?? '')
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"');
+  }
+
+  function triggerTraitRollFromSheet(rowId, rollAttrName = '') {
+    const rid = String(rowId || '').trim();
+    if (!rid) return false;
+    const char = getSelectedChar();
+    if (!char) return false;
+
+    const esc = escapeAttrSelectorValue(rid);
+
+    const preferredAttr = String(rollAttrName || '').trim();
+    const attrCandidates = [
+      preferredAttr,
+      `repeating_traits_${rid}_rollTrait`,
+      `repeating_traits_${rid}_rolltrait`,
+      `repeating_traits_${rid}_roll_trait`,
+      `repeating_traits_${rid}_trait`,
+    ].filter(Boolean);
+
+    for (const attrName of attrCandidates) {
+      if (!getCharAttrModel(char, attrName)) continue;
+      sendCommand(`@{${char.get('name')}|${attrName}}`);
+      return true;
+    }
+
+    const buttonSelectors = [
+      `button[name="roll_repeating_traits_${esc}_rollTrait"]`,
+      `button[name="roll_repeating_traits_${esc}_rolltrait"]`,
+      `button[name="roll_repeating_traits_${esc}_roll_trait"]`,
+      `button[name="roll_repeating_traits_${esc}_trait"]`,
+      `button[name*="repeating_traits_${esc}"][name*="roll"]`,
+      `[data-reprowid="${esc}"] button[name*="rollTrait"]`,
+      `[data-reprowid="${esc}"] button[type="roll"]`,
+      `[data-itemid="${esc}"] button[name*="rollTrait"]`,
+      `[data-itemid="${esc}"] button[type="roll"]`,
+      `.repitem[data-reprowid="${esc}"] button[type="roll"]`,
+      `button[name*="${esc}"][name*="rollTrait"]`,
+    ];
+
+    for (const selector of buttonSelectors) {
+      const btn = document.querySelector(selector);
+      if (!(btn instanceof HTMLElement)) continue;
+      btn.click();
+      return true;
+    }
+
+    // Fallback: some sheets render the roll action payload into an input/textarea field.
+    const inputSelectors = [
+      `[name="attr_repeating_traits_${esc}_rollTrait"]`,
+      `[name="attr_repeating_traits_${esc}_rolltrait"]`,
+      `[name*="repeating_traits_${esc}"][name*="rollTrait"]`,
+      `[name*="repeating_traits_${esc}"][name*="roll"]`,
+    ];
+    for (const selector of inputSelectors) {
+      const input = document.querySelector(selector);
+      if (!(input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement)) continue;
+      const payload = String(input.value || '').trim();
+      if (!payload) continue;
+      sendCommand(payload);
+      return true;
+    }
+
+    // Last fallback: try to reuse a real ability name from the character model.
+    const abilityModels = char?.abilities?.models || [];
+    const ability = abilityModels.find((model) => {
+      const abilityName = String(model?.get?.('name') || '').trim();
+      if (!abilityName) return false;
+      if (!abilityName.includes(rid)) return false;
+      if (!/trait/i.test(abilityName)) return false;
+      if (!/roll/i.test(abilityName)) return false;
+      return true;
+    });
+    if (ability) {
+      const abilityName = String(ability.get('name') || '').trim();
+      const cmd = buildCustomSheetActionCommand(abilityName);
+      if (cmd) {
+        sendCommand(cmd);
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /* ================= ROLL MODE ================= */
@@ -402,7 +517,13 @@
   }
 
   function getCharAttrModel(char, name) {
-    return (char?.attribs?.models || []).find((a) => a.get('name') === name) || null;
+    const models = char?.attribs?.models || [];
+    const exact = models.find((a) => a.get('name') === name);
+    if (exact) return exact;
+
+    const needle = String(name || '').toLowerCase();
+    if (!needle) return null;
+    return models.find((a) => String(a.get('name') || '').toLowerCase() === needle) || null;
   }
 
   function setCharAttrValue(char, name, value) {
@@ -910,6 +1031,124 @@
       .filter(Boolean);
   }
 
+  const CURRENCY_FIELDS = [
+    { key: 'gp', label: 'PO', attrs: ['po', 'gp'] },
+    { key: 'sp', label: 'PA', attrs: ['pa', 'sp'] },
+    { key: 'ep', label: 'PE', attrs: ['pe', 'ep'] },
+    { key: 'cp', label: 'PC', attrs: ['pc', 'cp'] },
+    { key: 'pp', label: 'PP', attrs: ['pp'] },
+  ];
+
+  function resolveCurrencyAttrName(char, key) {
+    const field = CURRENCY_FIELDS.find((f) => f.key === key);
+    if (!field) return key;
+
+    for (const attrName of field.attrs) {
+      if (getCharAttrModel(char, attrName)) return attrName;
+    }
+
+    return field.attrs[0] || key;
+  }
+
+  function getCurrencyValue(char, key) {
+    const field = CURRENCY_FIELDS.find((f) => f.key === key);
+    if (!field || !char) return 0;
+
+    for (const attrName of field.attrs) {
+      const model = getCharAttrModel(char, attrName);
+      if (!model) continue;
+      const parsed = parseIntSafe(model.get('current'), 0);
+      return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+    }
+
+    return 0;
+  }
+
+  function getCurrencyState() {
+    const char = getSelectedChar();
+    const items = CURRENCY_FIELDS.map((field) => {
+      const value = char ? getCurrencyValue(char, field.key) : 0;
+      const writeAttr = char ? resolveCurrencyAttrName(char, field.key) : field.attrs[0];
+      return { ...field, value, writeAttr };
+    });
+
+    const values = Object.fromEntries(items.map((item) => [item.key, item.value]));
+    const totalPo = values.gp + values.sp / 10 + values.ep / 2 + values.cp / 100 + values.pp * 10;
+
+    return { items, totalPo };
+  }
+
+  function formatPoTotal(value) {
+    const rounded = Math.round((Number(value) || 0) * 100) / 100;
+    return Number.isInteger(rounded)
+      ? String(rounded)
+      : rounded.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+  }
+
+  function buildCurrencyContent() {
+    const state = getCurrencyState();
+    const rows = state.items
+      .map(
+        (item) => `
+          <label class="tm-currency-row" data-label="Argent ${escapeHtml(item.label)}">
+            <span class="tm-currency-code">${escapeHtml(item.label)}</span>
+            <input
+              class="tm-currency-input"
+              data-currency-key="${escapeHtml(item.key)}"
+              data-currency-attr="${escapeHtml(item.writeAttr)}"
+              value="${escapeHtml(item.value)}"
+              inputmode="numeric"
+              autocomplete="off"
+              spellcheck="false">
+          </label>
+        `
+      )
+      .join('');
+
+    return `
+      <div class="tm-mod-cat tm-currency-cat">
+        <div class="tm-mod-title">Argent</div>
+        <div class="tm-currency-grid">${rows}</div>
+        <div class="tm-currency-total">Total PO : ${escapeHtml(formatPoTotal(state.totalPo))}</div>
+      </div>
+    `;
+  }
+
+  function buildCurrencyPanelContent() {
+    return `
+      <div class="tm-mods-wrap">
+        ${buildCurrencyContent()}
+      </div>
+    `;
+  }
+
+  function commitCurrencyInput(input) {
+    const key = String(input?.dataset?.currencyKey || '').trim();
+    if (!key) return;
+
+    const parsed = parseIntSafe(input.value, 0);
+    const next = Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+    input.value = String(next);
+
+    const char = getSelectedChar();
+    if (!char) return;
+    const targetAttr = resolveCurrencyAttrName(char, key);
+    setCharAttrValue(char, targetAttr, String(next));
+
+    const field = CURRENCY_FIELDS.find((f) => f.key === key);
+    if (field) {
+      field.attrs.forEach((attrName) => {
+        if (attrName === targetAttr) return;
+        if (!getCharAttrModel(char, attrName)) return;
+        setCharAttrValue(char, attrName, String(next));
+      });
+    }
+
+    if (currentSection === 'currency' && currentPopup) {
+      currentPopup.innerHTML = buildCurrencyPanelContent();
+    }
+  }
+
   function adjustResourceValue(valueAttr, maxAttr, delta) {
     const char = getSelectedChar();
     if (!char || !valueAttr) return;
@@ -938,53 +1177,45 @@
 
   function buildResourcesContent() {
     const items = getResourcesState();
+    const resourcesHtml = items.length
+      ? items
+          .map((item) => {
+            const nameClass =
+              item.resetType === 'long'
+                ? 'tm-resource-name is-long'
+                : item.resetType === 'short'
+                  ? 'tm-resource-name is-short'
+                  : 'tm-resource-name';
+            const qtyDisplay = item.max !== '--' ? `${item.value}/${item.max}` : item.value;
+            const tooltip = escapeHtml(`${item.label} : ${qtyDisplay}`);
 
-    if (!items.length) {
-      return `
-        <div class="tm-mods-wrap">
-          <div class="tm-mod-cat">
-            <div class="tm-mod-title">Ressources</div>
-            <div class="tm-mod-empty">Aucune ressource détectée</div>
-          </div>
-        </div>
-      `;
-    }
+            return `
+              <div class="tm-resource-item" data-label="${tooltip}">
+                <span class="${nameClass}">${escapeHtml(item.label)}</span>
+                <span class="tm-resource-qty">${escapeHtml(qtyDisplay)}</span>
+                <button
+                  class="tm-resource-step"
+                  data-resource-attr="${escapeHtml(item.valueAttr)}"
+                  data-resource-max="${escapeHtml(item.maxAttr || '')}"
+                  data-resource-delta="1"
+                  data-label="+1 ${escapeHtml(item.label)}">+</button>
+                <button
+                  class="tm-resource-step"
+                  data-resource-attr="${escapeHtml(item.valueAttr)}"
+                  data-resource-max="${escapeHtml(item.maxAttr || '')}"
+                  data-resource-delta="-1"
+                  data-label="-1 ${escapeHtml(item.label)}">-</button>
+              </div>
+            `;
+          })
+          .join('')
+      : '<div class="tm-mod-empty">Aucune ressource détectée</div>';
 
     return `
       <div class="tm-mods-wrap">
         <div class="tm-mod-cat">
           <div class="tm-mod-title">Ressources</div>
-          ${items
-            .map((item) => {
-              const nameClass =
-                item.resetType === 'long'
-                  ? 'tm-resource-name is-long'
-                  : item.resetType === 'short'
-                    ? 'tm-resource-name is-short'
-                    : 'tm-resource-name';
-              const qtyDisplay = item.max !== '--' ? `${item.value}/${item.max}` : item.value;
-              const tooltip = escapeHtml(`${item.label} : ${qtyDisplay}`);
-
-              return `
-                <div class="tm-resource-item" data-label="${tooltip}">
-                  <span class="${nameClass}">${escapeHtml(item.label)}</span>
-                  <span class="tm-resource-qty">${escapeHtml(qtyDisplay)}</span>
-                  <button
-                    class="tm-resource-step"
-                    data-resource-attr="${escapeHtml(item.valueAttr)}"
-                    data-resource-max="${escapeHtml(item.maxAttr || '')}"
-                    data-resource-delta="1"
-                    data-label="+1 ${escapeHtml(item.label)}">+</button>
-                  <button
-                    class="tm-resource-step"
-                    data-resource-attr="${escapeHtml(item.valueAttr)}"
-                    data-resource-max="${escapeHtml(item.maxAttr || '')}"
-                    data-resource-delta="-1"
-                    data-label="-1 ${escapeHtml(item.label)}">-</button>
-                </div>
-              `;
-            })
-            .join('')}
+          ${resourcesHtml}
         </div>
       </div>
     `;
@@ -1505,15 +1736,15 @@
 
   /* ================= REPEATING ATTACKS ================= */
 
-  function getRepeatingRows(char, section, nameField, actionField) {
+  function getRepeatingSectionRows(char, section) {
     const attrs = char?.attribs?.models || [];
-    const rowRegex = new RegExp(`^${section}_([^_]+)_${nameField}$`);
     const repOrderAttr = `_reporder_${section}`;
+    const rowRegex = new RegExp(`^${escapeRegExp(section)}_([^_]+)_(.+)$`);
     const byRowId = new Map();
     let orderedRowIds = [];
 
     attrs.forEach((attr) => {
-      const name = attr.get('name');
+      const name = String(attr.get('name') || '').trim();
       if (!name) return;
 
       if (name === repOrderAttr) {
@@ -1529,31 +1760,41 @@
       if (!match) return;
 
       const rowId = match[1];
-      const label = String(attr.get('current') || '').trim();
-      if (!label) return;
+      const field = match[2];
+      const value = String(attr.get('current') || '').trim();
 
-      byRowId.set(rowId, label);
+      if (!byRowId.has(rowId)) {
+        byRowId.set(rowId, { rowId, fields: Object.create(null) });
+      }
+      byRowId.get(rowId).fields[field] = value;
     });
 
     const rows = [];
 
     orderedRowIds.forEach((rowId) => {
       if (!byRowId.has(rowId)) return;
-      rows.push({
-        label: byRowId.get(rowId),
-        sheetAction: `${section}_${rowId}_${actionField}`,
-      });
+      rows.push(byRowId.get(rowId));
       byRowId.delete(rowId);
     });
 
-    byRowId.forEach((label, rowId) => {
-      rows.push({
-        label,
-        sheetAction: `${section}_${rowId}_${actionField}`,
-      });
-    });
+    Array.from(byRowId.values())
+      .sort((a, b) => a.rowId.localeCompare(b.rowId))
+      .forEach((row) => rows.push(row));
 
     return rows;
+  }
+
+  function getRepeatingRows(char, section, nameField, actionField) {
+    return getRepeatingSectionRows(char, section)
+      .map((row) => {
+        const label = String(row.fields[nameField] || '').trim();
+        if (!label) return null;
+        return {
+          label,
+          sheetAction: `${section}_${row.rowId}_${actionField}`,
+        };
+      })
+      .filter(Boolean);
   }
 
   function getCombatActions() {
@@ -1566,6 +1807,910 @@
     if (pcAttacks.length) return pcAttacks;
     if (npcActions.length) return npcActions;
     return [];
+  }
+
+  /* ================= TRAITS ================= */
+
+  function pickRowFieldValue(fields, candidates) {
+    const normalized = candidates.map((c) => String(c).toLowerCase());
+    const keys = Object.keys(fields || {});
+
+    for (const key of keys) {
+      const lower = key.toLowerCase();
+      const value = String(fields[key] || '').trim();
+      if (!value) continue;
+      if (normalized.includes(lower)) return value;
+    }
+
+    for (const key of keys) {
+      const lower = key.toLowerCase();
+      const value = String(fields[key] || '').trim();
+      if (!value) continue;
+      if (normalized.some((needle) => lower.includes(needle))) return value;
+    }
+
+    return '';
+  }
+
+  function pickRowFieldKey(fields, candidates) {
+    const normalized = candidates.map((c) => String(c).toLowerCase());
+    const keys = Object.keys(fields || {});
+
+    for (const key of keys) {
+      if (normalized.includes(key.toLowerCase())) return key;
+    }
+    for (const key of keys) {
+      if (normalized.some((needle) => key.toLowerCase().includes(needle))) return key;
+    }
+    return '';
+  }
+
+  function normalizeTraitSource(raw) {
+    const token = normalizeTextToken(raw);
+    if (!token) return 'Autre';
+    if (token.includes('class')) return 'Classe';
+    if (token.includes('racial') || token.includes('race')) return 'Racial';
+    if (token.includes('don') || token.includes('feat')) return 'Don';
+    if (token.includes('objet') || token.includes('item')) return 'Objet';
+    return 'Autre';
+  }
+
+  function traitSourceClass(source) {
+    const key = normalizeTextToken(source);
+    if (key === 'classe') return 'tm-trait-classe';
+    if (key === 'racial') return 'tm-trait-racial';
+    if (key === 'don') return 'tm-trait-don';
+    if (key === 'objet') return 'tm-trait-objet';
+    return 'tm-trait-autre';
+  }
+
+  function getTraitsState() {
+    const char = getSelectedChar();
+    if (!char) return { groups: [], selected: null };
+
+    const sourceOrder = ['Classe', 'Racial', 'Don', 'Objet', 'Autre'];
+    const groupsMap = new Map(sourceOrder.map((source) => [source, []]));
+    const rows = getRepeatingSectionRows(char, 'repeating_traits');
+
+    rows.forEach((row) => {
+      const name = pickRowFieldValue(row.fields, ['name', 'traitname', 'trait_name', 'title']);
+      if (!name) return;
+
+      const source = normalizeTraitSource(
+        pickRowFieldValue(row.fields, ['source', 'traitsource', 'source_type', 'source-type'])
+      );
+      const description = pickRowFieldValue(row.fields, [
+        'description',
+        'desc',
+        'content',
+        'details',
+        'text',
+      ]);
+      const key = `trait:${row.rowId}`;
+      const rollFieldKey =
+        pickRowFieldKey(row.fields, ['rollTrait', 'rolltrait', 'roll_trait', 'trait']) ||
+        'rollTrait';
+      const rollAttr = `repeating_traits_${row.rowId}_${rollFieldKey}`;
+
+      groupsMap.get(source).push({
+        key,
+        rowId: row.rowId,
+        name,
+        source,
+        description,
+        summary: shortSummary(description, 120),
+        rollAttr,
+      });
+    });
+
+    const groups = sourceOrder
+      .map((source) => ({ source, items: groupsMap.get(source) || [] }))
+      .filter((group) => group.items.length > 0);
+
+    if (!groups.length) return { groups: [], selected: null };
+
+    groups.forEach((group, idx) => {
+      if (typeof TRAIT_SOURCE_OPEN[group.source] !== 'boolean') {
+        TRAIT_SOURCE_OPEN[group.source] = idx === 0;
+      }
+    });
+
+    const allItems = groups.flatMap((group) => group.items);
+    const selected = allItems.find((item) => item.key === SELECTED_TRAIT_KEY) || null;
+
+    return { groups, selected };
+  }
+
+  function buildTraitsContent() {
+    const state = getTraitsState();
+    if (!state.groups.length) {
+      return `
+        <div class="tm-hud-wrap">
+          <div class="tm-mod-title">Capacités</div>
+          <div class="tm-mod-empty">Aucune capacité détectée</div>
+        </div>
+      `;
+    }
+
+    const groupsHtml = state.groups
+      .map((group) => {
+        const isOpen = Boolean(TRAIT_SOURCE_OPEN[group.source]);
+        const marker = isOpen ? 'v' : '>';
+        const sourceClass = traitSourceClass(group.source);
+
+        const itemsHtml = isOpen
+          ? `
+            <div class="tm-fold-list">
+              ${group.items
+                .map((item) => {
+                  const activeClass = state.selected?.key === item.key ? 'is-active' : '';
+                  const tooltip = escapeHtml(
+                    item.summary ? `${item.name} : ${item.summary}` : `Capacité : ${item.name}`
+                  );
+                  return `
+                    <button
+                      class="tm-list-item ${sourceClass} ${activeClass}"
+                      data-trait-item="${escapeHtml(item.key)}"
+                      data-label="${tooltip}">
+                      ${escapeHtml(item.name)}
+                    </button>
+                  `;
+                })
+                .join('')}
+            </div>
+          `
+          : '';
+
+        return `
+          <div class="tm-fold-block ${sourceClass}">
+            <button
+              class="tm-fold-toggle ${sourceClass}"
+              data-trait-source="${escapeHtml(group.source)}"
+              data-label="Source : ${escapeHtml(group.source)}">
+              ${escapeHtml(group.source)} ${marker}
+            </button>
+            ${itemsHtml}
+          </div>
+        `;
+      })
+      .join('');
+
+    const selected = state.selected;
+    const detailTitle = selected ? escapeHtml(selected.name) : 'Aucune capacité sélectionnée';
+    const detailBody = selected
+      ? asMultilineHtml(selected.description)
+      : '<span class="tm-detail-empty">Clique sur une capacité pour afficher sa description.</span>';
+    const detailAction = selected
+      ? `
+        <button
+          class="tm-detail-chat"
+          data-trait-rowid="${escapeHtml(selected.rowId)}"
+          data-trait-rollattr="${escapeHtml(selected.rollAttr || '')}"
+          data-label="Envoyer ${escapeHtml(selected.name)} dans le chat">
+          Envoyer au chat
+        </button>
+      `
+      : '';
+
+    return `
+      <div class="tm-hud-wrap tm-hud-wrap-split">
+        <div class="tm-hud-split-left">
+          <div class="tm-mod-title">Capacités</div>
+          ${groupsHtml}
+        </div>
+        <div class="tm-hud-split-right">
+          <div class="tm-detail-panel">
+            <div class="tm-detail-title">${detailTitle}</div>
+            ${detailAction}
+            <div class="tm-detail-body">${detailBody}</div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  /* ================= EQUIPMENT ================= */
+
+  function sheetCheckboxValue(raw) {
+    const token = normalizeTextToken(raw);
+    return (
+      token === '1' ||
+      token === 'true' ||
+      token === 'on' ||
+      token === 'yes' ||
+      token === 'oui' ||
+      token === 'checked' ||
+      token === 'active'
+    );
+  }
+
+  function normalizeEquipmentCategory(raw) {
+    const value = String(raw || '').trim();
+    if (!value) return 'INVENTAIRE';
+    return value.toUpperCase();
+  }
+
+  function getEquipmentState() {
+    const char = getSelectedChar();
+    if (!char) return [];
+
+    const rows = getRepeatingSectionRows(char, 'repeating_inventory');
+    const groups = new Map();
+    let currentCategory = 'INVENTAIRE';
+
+    function ensureCategory(name) {
+      if (!groups.has(name)) groups.set(name, []);
+      return groups.get(name);
+    }
+
+    ensureCategory(currentCategory);
+
+    rows.forEach((row) => {
+      const name = pickRowFieldValue(row.fields, ['itemname', 'name', 'item', 'item_name']);
+      if (!name) return;
+
+      const marker = name.match(/^\s*\[CAT\]\s*(.+)\s*$/i);
+      if (marker) {
+        currentCategory = normalizeEquipmentCategory(marker[1]);
+        ensureCategory(currentCategory);
+        return;
+      }
+
+      const equipField = pickRowFieldKey(row.fields, [
+        'equipped',
+        'itemequipped',
+        'is_equipped',
+        'isequipped',
+        'equip',
+      ]);
+
+      const equipAttr = `repeating_inventory_${row.rowId}_${equipField || 'equipped'}`;
+      const equipped = equipField ? sheetCheckboxValue(row.fields[equipField]) : false;
+
+      ensureCategory(currentCategory).push({
+        key: `equip:${row.rowId}`,
+        name,
+        equipAttr,
+        equipped,
+      });
+    });
+
+    const result = Array.from(groups.entries())
+      .map(([category, items]) => ({ category, items }))
+      .filter((group) => group.items.length > 0);
+
+    result.forEach((group, idx) => {
+      if (typeof EQUIPMENT_CATEGORY_OPEN[group.category] !== 'boolean') {
+        EQUIPMENT_CATEGORY_OPEN[group.category] = idx === 0;
+      }
+    });
+
+    return result;
+  }
+
+  function buildEquipmentContent() {
+    const groups = getEquipmentState();
+    if (!groups.length) {
+      return `
+        <div class="tm-hud-wrap">
+          <div class="tm-mod-title">Équipement</div>
+          <div class="tm-mod-empty">Aucun item détecté</div>
+        </div>
+      `;
+    }
+
+    const groupsHtml = groups
+      .map((group) => {
+        const isOpen = Boolean(EQUIPMENT_CATEGORY_OPEN[group.category]);
+        const marker = isOpen ? 'v' : '>';
+
+        const itemsHtml = isOpen
+          ? `
+            <div class="tm-fold-list">
+              ${group.items
+                .map((item) => {
+                  const tooltip = escapeHtml(`Objet : ${item.name}`);
+                  return `
+                    <label class="tm-equip-item" data-label="${tooltip}">
+                      <input
+                        type="checkbox"
+                        data-equip-attr="${escapeHtml(item.equipAttr)}"
+                        ${item.equipped ? 'checked' : ''}>
+                      <span class="tm-equip-name">${escapeHtml(item.name)}</span>
+                    </label>
+                  `;
+                })
+                .join('')}
+            </div>
+          `
+          : '';
+
+        return `
+          <div class="tm-fold-block tm-fold-up">
+            ${itemsHtml}
+            <button
+              class="tm-fold-toggle"
+              data-equip-category="${escapeHtml(group.category)}"
+              data-label="Catégorie : ${escapeHtml(group.category)}">
+              ${escapeHtml(group.category)} ${marker}
+            </button>
+          </div>
+        `;
+      })
+      .join('');
+
+    return `
+      <div class="tm-hud-wrap">
+        <div class="tm-mod-title">Équipement</div>
+        ${groupsHtml}
+      </div>
+    `;
+  }
+
+  /* ================= SPELLS ================= */
+
+  function getSpellMemAttrName(rowId) {
+    return `hud_spell_memorized_${String(rowId || '').trim()}`;
+  }
+
+  function getSpellPreparedAttrName(char, section, rowId, fields) {
+    const sec = String(section || '').trim();
+    const rid = String(rowId || '').trim();
+    if (!char || !sec || !rid) return '';
+
+    const preferredKey = pickRowFieldKey(fields || {}, [
+      'spellprepared',
+      'prepared',
+      'isprepared',
+      'prep',
+      'spell_prepared',
+      'prepared_flag',
+      'memorized',
+      'memorised',
+    ]);
+    if (preferredKey) {
+      return `${sec}_${rid}_${preferredKey}`;
+    }
+
+    const candidates = [
+      `${sec}_${rid}_spellprepared`,
+      `${sec}_${rid}_prepared`,
+      `${sec}_${rid}_isprepared`,
+      `${sec}_${rid}_prep`,
+      `${sec}_${rid}_spell_prepared`,
+      `${sec}_${rid}_prepared_flag`,
+      `${sec}_${rid}_memorized`,
+      `${sec}_${rid}_memorised`,
+    ];
+
+    for (const name of candidates) {
+      if (getCharAttrModel(char, name)) return name;
+    }
+
+    return '';
+  }
+
+  function getSpellPreparedState(char, section, rowId, fields) {
+    const preparedAttr = getSpellPreparedAttrName(char, section, rowId, fields);
+    if (preparedAttr) {
+      const raw = getAttrCurrentValue(char, preparedAttr);
+      return { memorized: isExplicitYesValue(raw), preparedAttr };
+    }
+
+    const fallbackAttr = getSpellMemAttrName(rowId);
+    const rawFallback = getAttrCurrentValue(char, fallbackAttr);
+    return { memorized: isExplicitYesValue(rawFallback), preparedAttr: '' };
+  }
+
+  function setSpellMemorized(rowId, preparedAttr, memorized) {
+    const char = getSelectedChar();
+    if (!char) return;
+
+    const nextValue = memorized ? '1' : '0';
+
+    if (preparedAttr) {
+      setCharAttrValue(char, preparedAttr, nextValue);
+      setSheetInputValueByAttrName(preparedAttr, nextValue);
+      setSheetCheckboxByAttrName(preparedAttr, memorized);
+    }
+
+    // Keep HUD fallback attr for sheets that do not expose a prepared flag.
+    setCharAttrValue(char, getSpellMemAttrName(rowId), nextValue);
+  }
+
+  function findSpellSlotAttrByCandidates(char, candidates) {
+    for (const name of candidates) {
+      if (getCharAttrModel(char, name)) return name;
+    }
+    return '';
+  }
+
+  function detectSpellSlotAttrs(char, level) {
+    if (!char || level <= 0) return { maxAttr: '', remainingAttr: '', usedAttr: '' };
+
+    const l = String(level);
+
+    const maxCandidates = [
+      `spell_slots_l${l}`,
+      `spell_slots_lvl${l}`,
+      `spell_slots_level${l}`,
+      `lvl${l}_slots_total`,
+      `level${l}_slots_total`,
+      `l${l}_slots_total`,
+      `spellslots_l${l}_total`,
+      `spellslots_lvl${l}_total`,
+    ];
+    const remainingCandidates = [
+      `spell_slots_l${l}_remaining`,
+      `spell_slots_l${l}_remain`,
+      `spell_slots_l${l}_rest`,
+      `spell_slots_l${l}_left`,
+      `lvl${l}_slots_remaining`,
+      `level${l}_slots_remaining`,
+      `l${l}_slots_remaining`,
+      `spellslots_l${l}_remaining`,
+      `spellslots_lvl${l}_remaining`,
+    ];
+    const usedCandidates = [
+      `spell_slots_l${l}_used`,
+      `spell_slots_l${l}_expended`,
+      `spell_slots_l${l}_spent`,
+      `lvl${l}_slots_expended`,
+      `level${l}_slots_expended`,
+      `l${l}_slots_expended`,
+      `spellslots_l${l}_used`,
+      `spellslots_lvl${l}_used`,
+    ];
+
+    let maxAttr = findSpellSlotAttrByCandidates(char, maxCandidates);
+    let remainingAttr = findSpellSlotAttrByCandidates(char, remainingCandidates);
+    let usedAttr = findSpellSlotAttrByCandidates(char, usedCandidates);
+
+    if (!maxAttr || (!remainingAttr && !usedAttr)) {
+      const allAttrNames = (char.attribs?.models || [])
+        .map((attr) => String(attr.get('name') || '').trim())
+        .filter(Boolean);
+      const levelRegex = new RegExp(`(?:^|_|-)(?:l|lvl|level)?${l}(?:_|-|$)`, 'i');
+      const pool = allAttrNames.filter(
+        (name) => /(slot|slots|spellslot|emplacement|emplacements)/i.test(name) && levelRegex.test(name)
+      );
+
+      if (!maxAttr) {
+        maxAttr =
+          pool.find((name) => /(total|max|maximum|totaux)/i.test(name)) ||
+          pool.find((name) => /spell_slots_l\d+$/i.test(name)) ||
+          maxAttr;
+      }
+      if (!remainingAttr) {
+        remainingAttr =
+          pool.find((name) => /(remaining|remain|left|restant|restants|current|courant)/i.test(name)) ||
+          remainingAttr;
+      }
+      if (!usedAttr) {
+        usedAttr =
+          pool.find((name) => /(used|expended|spent|consume|utilis|depens)/i.test(name)) ||
+          usedAttr;
+      }
+    }
+
+    return { maxAttr: maxAttr || '', remainingAttr: remainingAttr || '', usedAttr: usedAttr || '' };
+  }
+
+  function getSpellSlotsState(char, level) {
+    if (!char || level <= 0) return null;
+
+    const attrs = detectSpellSlotAttrs(char, level);
+    if (!attrs.maxAttr && !attrs.remainingAttr && !attrs.usedAttr) return null;
+
+    const maxRaw = attrs.maxAttr ? getAttrCurrentValue(char, attrs.maxAttr) : '';
+    const remainingRaw = attrs.remainingAttr ? getAttrCurrentValue(char, attrs.remainingAttr) : '';
+    const usedRaw = attrs.usedAttr ? getAttrCurrentValue(char, attrs.usedAttr) : '';
+
+    const maxParsed = parseIntSafe(maxRaw, NaN);
+    const remainingParsed = parseIntSafe(remainingRaw, NaN);
+    const usedParsed = parseIntSafe(usedRaw, NaN);
+
+    let max = Number.isFinite(maxParsed) ? Math.max(0, maxParsed) : NaN;
+    let remaining = Number.isFinite(remainingParsed) ? Math.max(0, remainingParsed) : NaN;
+    let used = Number.isFinite(usedParsed) ? Math.max(0, usedParsed) : NaN;
+
+    if (!Number.isFinite(remaining) && Number.isFinite(max) && Number.isFinite(used)) {
+      remaining = Math.max(0, max - used);
+    }
+
+    if (!Number.isFinite(used) && Number.isFinite(max) && Number.isFinite(remaining)) {
+      used = Math.max(0, max - remaining);
+    }
+
+    if (!Number.isFinite(max) && Number.isFinite(remaining) && Number.isFinite(used)) {
+      max = Math.max(0, remaining + used);
+    }
+
+    if (!Number.isFinite(max) && Number.isFinite(remaining)) {
+      max = remaining;
+    }
+
+    if (!Number.isFinite(remaining)) remaining = 0;
+    if (!Number.isFinite(used)) used = Number.isFinite(max) ? Math.max(0, max - remaining) : 0;
+    if (!Number.isFinite(max)) max = Math.max(remaining, used);
+
+    if (max > 0) {
+      remaining = Math.min(max, remaining);
+      used = Math.min(max, used);
+    }
+
+    return {
+      level,
+      max,
+      used,
+      remaining,
+      maxAttr: attrs.maxAttr,
+      remainingAttr: attrs.remainingAttr,
+      usedAttr: attrs.usedAttr,
+    };
+  }
+
+  function consumeSpellSlot(levelRaw) {
+    const level = parseIntSafe(levelRaw, 0);
+    if (!Number.isFinite(level) || level <= 0) return;
+
+    const char = getSelectedChar();
+    if (!char) return;
+    const slots = getSpellSlotsState(char, level);
+    if (!slots) return;
+
+    if (slots.remainingAttr) {
+      const nextRemaining = Math.max(0, slots.remaining - 1);
+      setCharAttrValue(char, slots.remainingAttr, String(nextRemaining));
+      if (slots.usedAttr && slots.max > 0) {
+        const nextUsed = Math.max(0, slots.max - nextRemaining);
+        setCharAttrValue(char, slots.usedAttr, String(nextUsed));
+      }
+    } else if (slots.usedAttr) {
+      const nextUsed = slots.max > 0 ? Math.min(slots.max, slots.used + 1) : slots.used + 1;
+      setCharAttrValue(char, slots.usedAttr, String(nextUsed));
+    }
+
+    if (currentSection === 'spells' && currentPopup) {
+      currentPopup.innerHTML = buildSpellsContent();
+    }
+  }
+
+  function getSpellSections(char) {
+    const attrs = char?.attribs?.models || [];
+    const sections = new Set();
+
+    attrs.forEach((attr) => {
+      const name = String(attr.get('name') || '').trim();
+      const match = name.match(/^(repeating_spell-\d+)_/i);
+      if (!match) return;
+      sections.add(match[1]);
+    });
+
+    return Array.from(sections).sort((a, b) => {
+      const la = parseIntSafe((a.match(/-(\d+)$/) || [])[1], 0);
+      const lb = parseIntSafe((b.match(/-(\d+)$/) || [])[1], 0);
+      return lb - la;
+    });
+  }
+
+  function triggerSpellRollFromSheet(section, rowId, rollAttrName = '') {
+    const sec = String(section || '').trim();
+    const rid = String(rowId || '').trim();
+    if (!sec || !rid) return false;
+
+    const char = getSelectedChar();
+    if (!char) return false;
+
+    const looksLikeRollPayload = (value) => {
+      const v = String(value || '').trim();
+      if (!v) return false;
+      return (
+        v.includes('&{template:') ||
+        v.includes('/roll') ||
+        v.includes('/r ') ||
+        v.includes('[[') ||
+        v.includes('%{') ||
+        v.includes('@{')
+      );
+    };
+
+    const preferredAttr = String(rollAttrName || '').trim();
+    const attrCandidates = [
+      preferredAttr,
+      `${sec}_${rid}_roll`,
+      `${sec}_${rid}_spell_roll`,
+      `${sec}_${rid}_rollspell`,
+      `${sec}_${rid}_roll_spell`,
+      `${sec}_${rid}_spellattack`,
+      `${sec}_${rid}_attack`,
+    ].filter(Boolean);
+
+    const escSec = escapeAttrSelectorValue(sec);
+    const escRid = escapeAttrSelectorValue(rid);
+
+    const rowRoots = Array.from(
+      document.querySelectorAll(`[data-reprowid="${escRid}"], [data-itemid="${escRid}"], .repitem[data-reprowid="${escRid}"]`)
+    );
+    for (const rowEl of rowRoots) {
+      const rollBtn =
+        rowEl.querySelector('button[type="roll"]') ||
+        rowEl.querySelector('button[name^="roll_"]') ||
+        rowEl.querySelector('button[name*="roll"]');
+      if (rollBtn instanceof HTMLElement) {
+        rollBtn.click();
+        return true;
+      }
+    }
+
+    const buttonSelectors = [
+      `button[name^="roll_${escSec}_${escRid}_"]`,
+      `button[name^="roll_repeating_spell-"][name*="${escRid}"]`,
+      `button[name="roll_${escSec}_${escRid}_spell"]`,
+      `button[name="roll_${escSec}_${escRid}_rollspell"]`,
+      `button[name="roll_${escSec}_${escRid}_roll_spell"]`,
+      `button[name*="roll_${escSec}_${escRid}"]`,
+      `[data-reprowid="${escRid}"] button[type="roll"]`,
+      `[data-itemid="${escRid}"] button[type="roll"]`,
+      `.repitem[data-reprowid="${escRid}"] button[type="roll"]`,
+    ];
+
+    for (const selector of buttonSelectors) {
+      const btn = document.querySelector(selector);
+      if (!(btn instanceof HTMLElement)) continue;
+      btn.click();
+      return true;
+    }
+
+    for (const attrName of attrCandidates) {
+      const model = getCharAttrModel(char, attrName);
+      if (!model) continue;
+      const raw = String(model.get('current') || '').trim();
+      if (!looksLikeRollPayload(raw)) continue;
+      sendCommand(raw);
+      return true;
+    }
+
+    const abilityCandidates = [
+      `${sec}_${rid}_rollspell`,
+      `${sec}_${rid}_roll_spell`,
+      `${sec}_${rid}_spell_roll`,
+      `${sec}_${rid}_roll`,
+    ];
+    for (const ability of abilityCandidates) {
+      const cmd = buildCustomSheetActionCommand(ability);
+      if (!cmd) continue;
+      sendCommand(cmd);
+      return true;
+    }
+
+    return false;
+  }
+
+  function getSpellsState() {
+    const char = getSelectedChar();
+    if (!char) return { levels: [], selected: null, hasMemorized: false, filterMemOnly: false };
+
+    const sections = getSpellSections(char);
+    const byLevel = new Map();
+    let hasMemorized = false;
+
+    sections.forEach((section) => {
+      const level = parseIntSafe((section.match(/-(\d+)$/) || [])[1], 0);
+      if (!byLevel.has(level)) byLevel.set(level, []);
+
+      const rows = getRepeatingSectionRows(char, section);
+      rows.forEach((row) => {
+        const name = pickRowFieldValue(row.fields, ['spellname', 'name']);
+        if (!name) return;
+
+        const description = pickRowFieldValue(row.fields, [
+          'spelldescription',
+          'spell_description',
+          'description',
+          'spellcontent',
+          'content',
+          'desc',
+        ]);
+        const castingTime = pickRowFieldValue(row.fields, [
+          'spellcastingtime',
+          'castingtime',
+          'casting_time',
+        ]);
+        const range = pickRowFieldValue(row.fields, ['spellrange', 'range']);
+        const rollField =
+          pickRowFieldKey(row.fields, ['spell', 'rollspell', 'roll_spell', 'attack', 'roll']) ||
+          'spell';
+        const rollAttr = `${section}_${row.rowId}_${rollField}`;
+        const preparedState = getSpellPreparedState(char, section, row.rowId, row.fields);
+        const memorized = preparedState.memorized;
+        if (memorized) hasMemorized = true;
+
+        byLevel.get(level).push({
+          key: `spell:${section}:${row.rowId}`,
+          section,
+          rowId: row.rowId,
+          rollAttr,
+          preparedAttr: preparedState.preparedAttr,
+          name,
+          level,
+          memorized,
+          description,
+          castingTime,
+          range,
+          summary: shortSummary(description, 120),
+        });
+      });
+    });
+
+    const levelsAll = Array.from(byLevel.keys())
+      .sort((a, b) => b - a)
+      .map((level) => {
+        const items = byLevel.get(level) || [];
+        items.sort((a, b) => {
+          const byMem = Number(b.memorized) - Number(a.memorized);
+          if (byMem !== 0) return byMem;
+          return a.name.localeCompare(b.name, 'fr', { sensitivity: 'base' });
+        });
+
+        return {
+          level,
+          slots: getSpellSlotsState(char, level),
+          items,
+        };
+      })
+      .filter((group) => group.items.length > 0);
+
+    if (!levelsAll.length) {
+      return { levels: [], selected: null, hasMemorized: false, filterMemOnly: false };
+    }
+
+    levelsAll.forEach((group, idx) => {
+      if (typeof SPELL_LEVEL_OPEN[group.level] !== 'boolean') {
+        SPELL_LEVEL_OPEN[group.level] = idx === 0;
+      }
+    });
+
+    const filterMemOnly = hasMemorized && !SPELL_SHOW_ALL;
+    const levels = levelsAll
+      .map((group) => ({
+        ...group,
+        items: filterMemOnly ? group.items.filter((item) => item.memorized) : group.items,
+      }))
+      .filter((group) => group.items.length > 0);
+
+    const allItems = levels.flatMap((group) => group.items);
+    let selected = allItems.find((item) => item.key === SELECTED_SPELL_KEY) || null;
+    if (!selected && allItems.length) {
+      selected = allItems[0];
+      SELECTED_SPELL_KEY = selected.key;
+    }
+
+    return { levels, selected, hasMemorized, filterMemOnly };
+  }
+
+  function buildSpellsContent() {
+    const state = getSpellsState();
+    if (!state.levels.length) {
+      return `
+        <div class="tm-hud-wrap">
+          <div class="tm-mod-title">Sorts</div>
+          <div class="tm-mod-empty">Aucun sort détecté</div>
+        </div>
+      `;
+    }
+
+    const filterToggle = state.hasMemorized
+      ? `
+        <button class="tm-spell-filter-toggle" data-spell-toggle-all="1" data-label="Filtre de sorts">
+          ${state.filterMemOnly ? 'Afficher tous les sorts' : 'Réduire aux mémorisés'}
+        </button>
+      `
+      : '';
+
+    const levelsHtml = state.levels
+      .map((group) => {
+        const isOpen = Boolean(SPELL_LEVEL_OPEN[group.level]);
+        const marker = isOpen ? 'v' : '>';
+
+        const spellsHtml = isOpen
+          ? `
+            <div class="tm-fold-list">
+              ${group.items
+                .map((spell) => {
+                  const activeClass = state.selected?.key === spell.key ? 'is-active' : '';
+                  const tooltip = escapeHtml(
+                    spell.summary ? `${spell.name} : ${spell.summary}` : `Sort : ${spell.name}`
+                  );
+                  return `
+                    <div class="tm-spell-row ${spell.memorized ? 'is-memorized' : ''}" data-label="${tooltip}">
+                      <input
+                        class="tm-spell-mem"
+                        type="checkbox"
+                        data-spell-mem-rowid="${escapeHtml(spell.rowId)}"
+                        data-spell-mem-attr="${escapeHtml(spell.preparedAttr || '')}"
+                        ${spell.memorized ? 'checked' : ''}>
+                      <button
+                        class="tm-list-item tm-spell-item ${activeClass} ${spell.memorized ? 'is-memorized' : 'is-unmemorized'}"
+                        data-spell-item="${escapeHtml(spell.key)}"
+                        data-spell-rowid="${escapeHtml(spell.rowId)}"
+                        data-spell-section="${escapeHtml(spell.section)}"
+                        data-spell-rollattr="${escapeHtml(spell.rollAttr)}"
+                        data-label="${tooltip}">
+                        ${escapeHtml(spell.name)}
+                      </button>
+                    </div>
+                  `;
+                })
+                .join('')}
+            </div>
+          `
+          : '';
+
+        const slotsHtml =
+          group.slots
+            ? `
+              <div class="tm-spell-slot-wrap">
+                <span class="tm-spell-slot-count ${group.slots.remaining <= 0 ? 'is-empty' : ''}">
+                  ${escapeHtml(group.slots.remaining)}/${escapeHtml(group.slots.max)}
+                </span>
+                <button
+                  class="tm-spell-slot-use"
+                  data-spell-slot-use="${escapeHtml(group.level)}"
+                  data-label="Utiliser 1 emplacement de niveau ${escapeHtml(group.level)}">-</button>
+              </div>
+            `
+            : '';
+
+        return `
+          <div class="tm-fold-block">
+            <div class="tm-spell-level-head">
+              <button
+                class="tm-fold-toggle tm-spell-level-toggle"
+                data-spell-level="${escapeHtml(group.level)}"
+                data-label="Niveau ${escapeHtml(group.level)}">
+                Niv ${escapeHtml(group.level)} ${marker}
+              </button>
+              ${slotsHtml}
+            </div>
+            ${spellsHtml}
+          </div>
+        `;
+      })
+      .join('');
+
+    const selected = state.selected;
+    const detailTitle = selected ? escapeHtml(selected.name) : 'Détail';
+    const detailMeta = selected
+      ? `
+        <div class="tm-spell-meta">
+          ${
+            selected.castingTime
+              ? `<div><span class="tm-spell-key">Incantation :</span> ${escapeHtml(selected.castingTime)}</div>`
+              : ''
+          }
+          ${selected.range ? `<div><span class="tm-spell-key">Portée :</span> ${escapeHtml(selected.range)}</div>` : ''}
+        </div>
+      `
+      : '';
+    const detailBody = selected ? asMultilineHtml(selected.description) : '<span class="tm-detail-empty">Aucun sort.</span>';
+
+    return `
+      <div class="tm-hud-wrap tm-hud-wrap-split">
+        <div class="tm-hud-split-left">
+          <div class="tm-mod-title">Sorts</div>
+          ${filterToggle}
+          ${levelsHtml}
+        </div>
+        <div class="tm-hud-split-right">
+          <div class="tm-detail-panel">
+            <div class="tm-detail-title">${detailTitle}</div>
+            ${detailMeta}
+            <div class="tm-detail-body">${detailBody}</div>
+          </div>
+        </div>
+      </div>
+    `;
   }
 
   /* ================= BUILD ================= */
@@ -1634,7 +2779,12 @@
 
   root.innerHTML = `
     <div id="tm-bar">
-      <div class="toggle settings" data-sec="settings" data-label="Réglages">⚙️</div>
+      <div id="tm-left-tools">
+        <div class="toggle icon-only" data-sec="currency" data-label="Bourse">
+          <img src="${icon('coins')}">
+        </div>
+        <div class="toggle settings" data-sec="settings" data-label="Réglages">⚙️</div>
+      </div>
       <div id="tm-roll-hp-wrap">
         <div id="tm-stats-grid" data-label="Combat, points de vie et modes">
           <div class="tm-stats-col" data-col="1">
@@ -1690,6 +2840,11 @@
           <div class="toggle" data-sec="resource" data-label="Ressources"><span>Ressources</span></div>
           <div class="toggle" data-sec="mods" data-label="Modificateurs globaux"><span>Mods</span></div>
         </div>
+        <div id="tm-extra-col">
+          <div class="toggle" data-sec="spells" data-label="Sorts"><span>Sorts</span></div>
+          <div class="toggle" data-sec="traits" data-label="Capacités"><span>Capacités</span></div>
+          <div class="toggle" data-sec="equipment" data-label="Équipement"><span>Équipement</span></div>
+        </div>
       </div>
       <div id="tm-popup-zone" data-label="Zone accordéon"></div>
     </div>
@@ -1711,6 +2866,7 @@
       --tm-accordion-width:140px;
       --tm-popup-zone-width:calc(var(--tm-accordion-width) * 3);
       --tm-accordion-wide-width:calc(var(--tm-accordion-width) * 1.2);
+      --tm-accordion-xwide-width:calc(var(--tm-accordion-width) * 2.1);
       --tm-main-toggle-width:calc(var(--tm-accordion-width) * 0.9);
       --tm-cell-size:40px;
       --tm-cell-gap:4px;
@@ -1723,6 +2879,13 @@
 
     #tm-bar{display:flex;gap:8px;align-items:flex-end}
 
+    #tm-left-tools{
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+      align-self:flex-end;
+    }
+
     #tm-right-big-wrap{
       display:flex;
       gap:8px;
@@ -1730,7 +2893,8 @@
     }
 
     #tm-left-col,
-    #tm-mid-col{
+    #tm-mid-col,
+    #tm-extra-col{
       display:flex;
       flex-direction:column;
       gap:4px;
@@ -1750,6 +2914,12 @@
       color:#fff;
       cursor:pointer;
       box-sizing:border-box;
+    }
+
+    .toggle.icon-only{
+      width:var(--tm-cell-size);
+      min-width:var(--tm-cell-size);
+      padding:0;
     }
 
     .settings{
@@ -1894,16 +3064,381 @@
       width:var(--tm-accordion-wide-width);
     }
 
+    .tm-popup.is-xwide .tm-cell-wide{
+      width:var(--tm-accordion-xwide-width);
+    }
+
+    .tm-popup.is-xwide .combat-action{
+      width:var(--tm-accordion-xwide-width);
+    }
+
+    .tm-popup.is-xwide .tm-empty-combat{
+      width:var(--tm-accordion-xwide-width);
+    }
+
+    .tm-popup.is-xwide .tm-mods-wrap,
+    .tm-popup.is-xwide .tm-mod-cat,
+    .tm-popup.is-xwide .tm-hud-wrap{
+      width:var(--tm-accordion-xwide-width);
+    }
+
+    .tm-popup.is-detail-right .tm-hud-wrap{
+      width:calc(var(--tm-accordion-width) * 3.2);
+    }
+
     .tm-popup.tm-popup-settings{
-      left:50%;
+      left:calc(-100% - var(--tm-cell-gap));
       bottom:calc(100% + var(--tm-cell-gap));
-      transform:translateX(-50%);
+      transform:none;
+    }
+
+    .tm-popup.tm-popup-currency{
+      left:auto;
+      right:calc(100% + var(--tm-cell-gap));
+      bottom:0;
+      transform:none;
     }
 
     .tm-row{display:flex;gap:4px}
     .tm-cell{display:flex}
     .tm-cell-wide{width:var(--tm-accordion-width)}
     .tm-settings-col{display:flex;flex-direction:column;gap:4px}
+
+    .tm-hud-wrap{
+      width:var(--tm-accordion-wide-width);
+      background:rgba(0,0,0,0.92);
+      border:1px solid rgba(255,165,0,0.65);
+      border-radius:8px;
+      padding:6px;
+      box-sizing:border-box;
+      display:flex;
+      flex-direction:column;
+      gap:5px;
+    }
+
+    .tm-hud-wrap.tm-hud-wrap-split{
+      display:grid;
+      grid-template-columns:minmax(0,1.05fr) minmax(0,0.95fr);
+      align-items:stretch;
+      gap:6px;
+    }
+
+    .tm-hud-split-left{
+      display:flex;
+      flex-direction:column;
+      gap:5px;
+      min-width:0;
+    }
+
+    .tm-hud-split-right{
+      display:flex;
+      min-width:0;
+    }
+
+    .tm-hud-wrap-split .tm-detail-panel{
+      margin-top:0;
+      flex:1 1 auto;
+    }
+
+    .tm-hud-wrap-split .tm-detail-body{
+      max-height:280px;
+    }
+
+    .tm-fold-block{
+      display:flex;
+      flex-direction:column;
+      gap:3px;
+    }
+
+    .tm-fold-block.tm-fold-up{
+      flex-direction:column;
+    }
+
+    .tm-fold-toggle{
+      width:100%;
+      height:28px;
+      min-height:28px;
+      justify-content:flex-start;
+      padding:0 8px;
+      font-size:11px;
+      font-weight:700;
+      border-radius:7px;
+    }
+
+    .tm-fold-list{
+      display:flex;
+      flex-direction:column;
+      gap:3px;
+      max-height:150px;
+      overflow:auto;
+      padding-right:2px;
+    }
+
+    .tm-list-item{
+      width:100%;
+      height:28px;
+      min-height:28px;
+      justify-content:flex-start;
+      padding:0 8px;
+      font-size:11px;
+      border-radius:7px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+
+    .tm-list-item.is-active{
+      background:rgba(28,130,58,0.28);
+      outline:1px solid rgba(126,255,170,0.55);
+    }
+
+    .tm-fold-toggle.tm-trait-classe,
+    .tm-list-item.tm-trait-classe{ border-color:rgba(74,201,126,0.85); }
+    .tm-list-item.tm-trait-classe.is-active{ background:rgba(36,122,72,0.42); outline-color:rgba(98,232,159,0.85); }
+
+    .tm-fold-toggle.tm-trait-racial,
+    .tm-list-item.tm-trait-racial{ border-color:rgba(88,171,255,0.85); }
+    .tm-list-item.tm-trait-racial.is-active{ background:rgba(35,84,137,0.42); outline-color:rgba(120,193,255,0.85); }
+
+    .tm-fold-toggle.tm-trait-don,
+    .tm-list-item.tm-trait-don{ border-color:rgba(191,132,255,0.9); }
+    .tm-list-item.tm-trait-don.is-active{ background:rgba(99,51,147,0.4); outline-color:rgba(206,162,255,0.85); }
+
+    .tm-fold-toggle.tm-trait-objet,
+    .tm-list-item.tm-trait-objet{ border-color:rgba(255,179,92,0.9); }
+    .tm-list-item.tm-trait-objet.is-active{ background:rgba(120,74,28,0.45); outline-color:rgba(255,201,136,0.85); }
+
+    .tm-fold-toggle.tm-trait-autre,
+    .tm-list-item.tm-trait-autre{ border-color:rgba(185,185,185,0.8); }
+    .tm-list-item.tm-trait-autre.is-active{ background:rgba(86,86,86,0.42); outline-color:rgba(230,230,230,0.8); }
+
+    .tm-detail-panel{
+      margin-top:2px;
+      border:1px solid rgba(255,165,0,0.45);
+      border-radius:7px;
+      padding:6px;
+      background:rgba(10,10,10,0.75);
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+    }
+
+    .tm-detail-title{
+      color:#fff;
+      font-size:12px;
+      font-weight:700;
+      line-height:1.2;
+    }
+
+    .tm-detail-chat{
+      width:100%;
+      height:28px;
+      min-height:28px;
+      justify-content:center;
+      font-size:11px;
+      font-weight:700;
+      border-radius:7px;
+      border-color:rgba(120,193,255,0.85);
+      color:#b9ddff;
+    }
+
+    .tm-detail-body{
+      color:#ddd;
+      font-size:11px;
+      line-height:1.35;
+      max-height:160px;
+      overflow:auto;
+      white-space:normal;
+      word-break:break-word;
+      padding-right:2px;
+    }
+
+    .tm-detail-empty{
+      color:#aaa;
+      font-style:italic;
+    }
+
+    .tm-spell-meta{
+      color:#ddd;
+      font-size:10px;
+      line-height:1.25;
+      display:flex;
+      flex-direction:column;
+      gap:2px;
+    }
+
+    .tm-spell-key{
+      color:#ffc05f;
+      font-weight:700;
+    }
+
+    .tm-spell-filter-toggle{
+      width:100%;
+      height:28px;
+      min-height:28px;
+      justify-content:center;
+      padding:0 8px;
+      font-size:11px;
+      font-weight:700;
+      border-radius:7px;
+      border-color:rgba(120,193,255,0.85);
+      color:#b9ddff;
+    }
+
+    .tm-spell-level-head{
+      display:flex;
+      align-items:center;
+      gap:4px;
+    }
+
+    .tm-spell-level-toggle{
+      flex:1 1 auto;
+      min-width:0;
+    }
+
+    .tm-spell-slot-wrap{
+      display:flex;
+      align-items:center;
+      gap:4px;
+      flex:0 0 auto;
+    }
+
+    .tm-spell-slot-count{
+      min-width:40px;
+      height:28px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      border:1px solid rgba(255,165,0,0.6);
+      border-radius:7px;
+      color:#d6d6d6;
+      font-size:10px;
+      font-weight:700;
+      background:rgba(0,0,0,0.45);
+      box-sizing:border-box;
+      padding:0 5px;
+    }
+
+    .tm-spell-slot-count.is-empty{
+      color:#888;
+      border-color:rgba(140,140,140,0.55);
+    }
+
+    .tm-spell-slot-use{
+      width:28px;
+      height:28px;
+      min-width:28px;
+      border-radius:7px;
+      font-size:16px;
+      font-weight:700;
+      line-height:1;
+      padding:0;
+    }
+
+    .tm-spell-row{
+      display:flex;
+      align-items:center;
+      gap:4px;
+    }
+
+    .tm-spell-mem{
+      width:13px;
+      height:13px;
+      margin:0;
+      flex:0 0 auto;
+    }
+
+    .tm-spell-item{
+      flex:1 1 auto;
+      min-width:0;
+    }
+
+    .tm-spell-item.is-memorized{
+      border-color:rgba(88,171,255,0.85);
+      background:rgba(31,74,124,0.25);
+    }
+
+    .tm-spell-item.is-unmemorized{
+      opacity:0.88;
+    }
+
+    .tm-equip-item{
+      display:flex;
+      align-items:center;
+      gap:6px;
+      min-height:24px;
+      border:1px solid rgba(255,165,0,0.35);
+      border-radius:7px;
+      padding:3px 6px;
+      background:rgba(0,0,0,0.35);
+      color:#fff;
+      font-size:11px;
+      box-sizing:border-box;
+    }
+
+    .tm-equip-item input{
+      width:12px;
+      height:12px;
+      margin:0;
+      flex:0 0 auto;
+    }
+
+    .tm-equip-name{
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+
+    .tm-currency-cat{
+      display:flex;
+      flex-direction:column;
+      gap:5px;
+    }
+
+    .tm-currency-grid{
+      display:flex;
+      flex-direction:column;
+      gap:4px;
+    }
+
+    .tm-currency-row{
+      display:grid;
+      grid-template-columns:24px 1fr;
+      align-items:center;
+      gap:6px;
+      color:#fff;
+      font-size:11px;
+    }
+
+    .tm-currency-code{
+      color:#ffc05f;
+      font-weight:700;
+      text-align:left;
+    }
+
+    .tm-currency-input{
+      width:100%;
+      height:24px;
+      border:1px solid rgba(255,165,0,0.6);
+      border-radius:6px;
+      background:#000;
+      color:#fff;
+      padding:0 6px;
+      box-sizing:border-box;
+      font-size:11px;
+    }
+
+    .tm-currency-input:focus{
+      outline:none;
+      border-color:rgba(120,193,255,0.85);
+      box-shadow:0 0 0 1px rgba(120,193,255,0.35);
+    }
+
+    .tm-currency-total{
+      color:#ddd;
+      font-size:10px;
+      text-align:right;
+    }
 
     button{
       width:40px;height:40px;
@@ -2160,8 +3695,24 @@
       content = buildResourcesContent();
     }
 
+    if (sec === 'currency') {
+      content = buildCurrencyPanelContent();
+    }
+
     if (sec === 'mods') {
       content = buildGlobalModsContent();
+    }
+
+    if (sec === 'traits') {
+      content = buildTraitsContent();
+    }
+
+    if (sec === 'equipment') {
+      content = buildEquipmentContent();
+    }
+
+    if (sec === 'spells') {
+      content = buildSpellsContent();
     }
 
     if (sec === 'settings') {
@@ -2177,8 +3728,15 @@
     if (sec === 'settings') {
       popup.classList.add('tm-popup-settings');
       el.appendChild(popup);
+    } else if (sec === 'currency') {
+      popup.classList.add('is-wide', 'tm-popup-currency');
+      el.appendChild(popup);
     } else {
-      if (sec === 'combat' || sec === 'resource' || sec === 'mods') {
+      if (sec === 'spells' || sec === 'traits') {
+        popup.classList.add('is-xwide', 'is-detail-right');
+      } else if (sec === 'equipment') {
+        popup.classList.add('is-xwide');
+      } else if (sec === 'combat' || sec === 'resource' || sec === 'mods') {
         popup.classList.add('is-wide');
       }
       (popupHost || el).appendChild(popup);
@@ -2239,8 +3797,70 @@
         return;
       }
 
+      if (btn.dataset.traitSource) {
+        const key = btn.dataset.traitSource;
+        TRAIT_SOURCE_OPEN[key] = !TRAIT_SOURCE_OPEN[key];
+        if (currentSection === 'traits' && currentPopup) {
+          currentPopup.innerHTML = buildTraitsContent();
+        }
+        return;
+      }
+
+      if (btn.dataset.traitItem) {
+        SELECTED_TRAIT_KEY = btn.dataset.traitItem;
+        if (currentSection === 'traits' && currentPopup) {
+          currentPopup.innerHTML = buildTraitsContent();
+        }
+        return;
+      }
+
+      if (btn.dataset.equipCategory) {
+        const key = btn.dataset.equipCategory;
+        EQUIPMENT_CATEGORY_OPEN[key] = !EQUIPMENT_CATEGORY_OPEN[key];
+        if (currentSection === 'equipment' && currentPopup) {
+          currentPopup.innerHTML = buildEquipmentContent();
+        }
+        return;
+      }
+
+      if (btn.dataset.spellLevel) {
+        const level = btn.dataset.spellLevel;
+        SPELL_LEVEL_OPEN[level] = !SPELL_LEVEL_OPEN[level];
+        if (currentSection === 'spells' && currentPopup) {
+          currentPopup.innerHTML = buildSpellsContent();
+        }
+        return;
+      }
+
+      if (btn.dataset.spellToggleAll) {
+        SPELL_SHOW_ALL = !SPELL_SHOW_ALL;
+        localStorage.setItem('tm_spell_show_all', SPELL_SHOW_ALL ? '1' : '0');
+        if (currentSection === 'spells' && currentPopup) {
+          currentPopup.innerHTML = buildSpellsContent();
+        }
+        return;
+      }
+
+      if (btn.dataset.spellSlotUse) {
+        consumeSpellSlot(btn.dataset.spellSlotUse);
+        return;
+      }
+
+      if (btn.dataset.spellItem) {
+        SELECTED_SPELL_KEY = btn.dataset.spellItem;
+        if (currentSection === 'spells' && currentPopup) {
+          currentPopup.innerHTML = buildSpellsContent();
+        }
+        return;
+      }
+
       if (btn.classList.contains('dv-value')) {
         adjustHpValue('dv', -1);
+      }
+
+      if (btn.dataset.traitRowid) {
+        triggerTraitRollFromSheet(btn.dataset.traitRowid, btn.dataset.traitRollattr || '');
+        return;
       }
 
       if (btn.dataset.sheetAction) {
@@ -2258,6 +3878,7 @@
     if (modInput && root.contains(modInput)) return;
     if (e.target.closest('.tm-mod-item')) return;
     if (e.target.closest('.tm-resource-item')) return;
+    if (e.target.closest('.tm-popup')) return;
 
     const toggle = e.target.closest('.toggle');
     if (!toggle || !root.contains(toggle)) return;
@@ -2266,6 +3887,28 @@
   });
 
   root.addEventListener('change', (e) => {
+    const spellMemInput = e.target.closest('input[type="checkbox"][data-spell-mem-rowid]');
+    if (spellMemInput && root.contains(spellMemInput)) {
+      setSpellMemorized(
+        spellMemInput.dataset.spellMemRowid,
+        spellMemInput.dataset.spellMemAttr || '',
+        spellMemInput.checked
+      );
+      if (currentSection === 'spells' && currentPopup) {
+        currentPopup.innerHTML = buildSpellsContent();
+      }
+      return;
+    }
+
+    const equipInput = e.target.closest('input[type="checkbox"][data-equip-attr]');
+    if (equipInput && root.contains(equipInput)) {
+      const char = getSelectedChar();
+      if (char) {
+        setCharAttrValue(char, equipInput.dataset.equipAttr, equipInput.checked ? '1' : '0');
+      }
+      return;
+    }
+
     const modInput = e.target.closest('input[type="checkbox"][data-mod-attr]');
     if (!modInput || !root.contains(modInput)) return;
     setGlobalModifierActive(
@@ -2277,6 +3920,21 @@
       modInput.dataset.modField,
       modInput.dataset.modKey
     );
+  });
+
+  root.addEventListener('keydown', (e) => {
+    const input = e.target.closest('input[data-currency-attr]');
+    if (!input || !root.contains(input)) return;
+    if (e.key !== 'Enter') return;
+    e.preventDefault();
+    commitCurrencyInput(input);
+    input.blur();
+  });
+
+  root.addEventListener('focusout', (e) => {
+    const input = e.target.closest('input[data-currency-attr]');
+    if (!input || !root.contains(input)) return;
+    commitCurrencyInput(input);
   });
 
   root.addEventListener('mousemove', (e) => {
