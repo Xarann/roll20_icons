@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Roll20 HUD
 // @namespace    http://tampermonkey.net/
-// @version      7.05
+// @version      7.09
 // @match        https://app.roll20.net/editor/
 // @grant        none
 // ==/UserScript==
@@ -163,39 +163,128 @@
     return `${text.slice(0, Math.max(0, maxLen - 3)).trim()}...`;
   }
 
-  function spellComponentsFromFields(fields) {
-    const direct = pickRowFieldValue(fields, [
-      'spellcomp',
-      'spellcomponents',
-      'components',
-      'spell_component',
-      'component',
-    ]);
-    if (direct) return direct;
+  function hasTemplateFlag(raw, flagToken) {
+    const text = String(raw || '').trim();
+    if (!text) return false;
+    if (isExplicitYesValue(text)) return true;
+    const safeToken = String(flagToken || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!safeToken) return false;
+    const re = new RegExp(`\\b${safeToken}\\s*=\\s*1\\b`, 'i');
+    return re.test(text);
+  }
 
-    const yes = (name) => {
-      const v = String(fields?.[name] || '').trim();
-      return isExplicitYesValue(v);
+  function isDisabledSpellFlagValue(raw) {
+    const token = normalizeTextToken(raw);
+    return (
+      token === '' ||
+      token === '0' ||
+      token === 'false' ||
+      token === 'off' ||
+      token === 'none' ||
+      token === 'no' ||
+      token === 'non' ||
+      token === 'null'
+    );
+  }
+
+  function isEnabledSpellFlagValue(raw, token) {
+    if (isDisabledSpellFlagValue(raw)) return false;
+    return hasTemplateFlag(raw, token) || isExplicitYesValue(raw);
+  }
+
+  function parseSpellFlagRaw(raw, token) {
+    const text = String(raw || '').trim();
+    if (!text) return null;
+    return isEnabledSpellFlagValue(text, token);
+  }
+
+  function spellComponentFlagsFromFields(fields, durationValue = '') {
+    const allFields = fields || {};
+    const readExactField = (targetNames) => {
+      const names = (targetNames || []).map((n) => String(n || '').toLowerCase().trim()).filter(Boolean);
+      if (!names.length) return '';
+      for (const [rawKey, rawVal] of Object.entries(allFields)) {
+        const key = String(rawKey || '').toLowerCase().trim();
+        if (!names.includes(key)) continue;
+        return String(rawVal || '').trim();
+      }
+      return '';
     };
 
-    const parts = [];
-    if (yes('spellcomp_v') || yes('spellcompverbal') || yes('verbal')) parts.push('V');
-    if (yes('spellcomp_s') || yes('spellcompsomatic') || yes('somatic')) parts.push('S');
-    if (yes('spellcomp_m') || yes('spellcompmaterial') || yes('material')) parts.push('M');
+    const vRaw = readExactField(['spellcomp_v', 'spellcompv']);
+    const sRaw = readExactField(['spellcomp_s', 'spellcomps']);
+    const mRaw = readExactField(['spellcomp_m', 'spellcompm']);
+    const cRaw = readExactField(['spellconcentration', 'concentration', 'spell_concentration']);
+    const rRaw = readExactField(['spellritual', 'ritual', 'spell_ritual']);
+    const durationToken = normalizeTextToken(durationValue);
 
-    const material = pickRowFieldValue(fields, [
+    // Strict V/S/M detection based on spellcomp_v/s/m values:
+    // 0 => absent, {{x=1}} (or explicit yes) => present.
+    const v = isEnabledSpellFlagValue(vRaw, 'v');
+    const s = isEnabledSpellFlagValue(sRaw, 's');
+    const m = isEnabledSpellFlagValue(mRaw, 'm');
+    const c = isEnabledSpellFlagValue(cRaw, 'concentration') || isEnabledSpellFlagValue(cRaw, 'c') || /\bconcentration\b/.test(durationToken);
+    const r = isEnabledSpellFlagValue(rRaw, 'ritual') || isEnabledSpellFlagValue(rRaw, 'r');
+
+    return { v, s, m, c, r };
+  }
+
+  function spellMaterialFromFields(fields) {
+    return pickRowFieldValue(fields, [
       'spellcomp_materials',
       'spellcompmaterials',
       'materials',
       'material',
       'spell_material',
     ]);
+  }
+
+  function spellComponentsFromFields(fields, componentFlags = null) {
+    const flags = componentFlags || spellComponentFlagsFromFields(fields);
+
+    const parts = [];
+    if (flags.v) parts.push('V');
+    if (flags.s) parts.push('S');
+    if (flags.m) parts.push('M');
+
+    const material = spellMaterialFromFields(fields);
     if (material) {
       if (!parts.includes('M')) parts.push('M');
       return `${parts.join(', ')} (${material})`;
     }
 
     return parts.join(', ');
+  }
+
+  function buildSpellBadgesHtml(flags, options = null) {
+    const f = flags || {};
+    const opts = {
+      v: true,
+      s: true,
+      m: true,
+      c: true,
+      r: true,
+      ...(options || {}),
+    };
+    const badges = [];
+
+    if (f.v && opts.v) {
+      badges.push('<span class="tm-spell-badge tm-spell-badge-v" data-label="Composante verbale">V</span>');
+    }
+    if (f.s && opts.s) {
+      badges.push('<span class="tm-spell-badge tm-spell-badge-s" data-label="Composante somatique">S</span>');
+    }
+    if (f.m && opts.m) {
+      badges.push('<span class="tm-spell-badge tm-spell-badge-m" data-label="Composante matérielle">M</span>');
+    }
+    if (f.c && opts.c) {
+      badges.push('<span class="tm-spell-badge tm-spell-badge-c" data-label="Concentration">C</span>');
+    }
+    if (f.r && opts.r) {
+      badges.push('<span class="tm-spell-badge tm-spell-badge-r" data-label="Rituel">R</span>');
+    }
+
+    return badges.length ? `<span class="tm-spell-badges">${badges.join('')}</span>` : '';
   }
 
   function button(cmd) {
@@ -2665,6 +2754,249 @@
     return false;
   }
 
+  function readFormControlCurrentValue(control) {
+    if (control instanceof HTMLInputElement) {
+      const type = String(control.type || '').toLowerCase();
+      if (type === 'hidden') {
+        const rawAttrValue = control.getAttribute('value');
+        if (rawAttrValue != null && String(rawAttrValue).trim() !== '') {
+          return String(rawAttrValue).trim();
+        }
+        return String(control.value || '').trim();
+      }
+      if (type === 'checkbox') {
+        return control.checked ? String(control.value || '1').trim() : '0';
+      }
+      return String(control.value || '').trim();
+    }
+    if (control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement) {
+      return String(control.value || '').trim();
+    }
+    return '';
+  }
+
+  function findSpellRowElementByName(sectionName, spellName, rowIdHint = '') {
+    const section = String(sectionName || '').trim();
+    const label = normalizeTextToken(spellName);
+    if (!section || !label) return null;
+
+    const escSection = escapeAttrSelectorValue(section);
+    const container = document.querySelector(`.repcontainer[data-groupname="${escSection}"]`);
+    if (!(container instanceof Element)) return null;
+
+    const hint = String(rowIdHint || '').trim();
+    const rows = Array.from(container.querySelectorAll('.repitem[data-reprowid], .repitem[data-itemid]'));
+    let fallback = null;
+    for (const rowEl of rows) {
+      const nameEl =
+        rowEl.querySelector('.display .spellname[name="attr_spellname"]') ||
+        rowEl.querySelector('.display .spellname') ||
+        rowEl.querySelector('button.spellcard .spellname') ||
+        rowEl.querySelector('.details span[name="attr_spellname"]');
+      const rowName = normalizeTextToken(nameEl?.textContent || '');
+      if (!rowName || rowName !== label) continue;
+
+      const rid = String(rowEl.getAttribute('data-reprowid') || rowEl.getAttribute('data-itemid') || '').trim();
+      if (hint && rid && rid === hint) return rowEl;
+      if (!fallback) fallback = rowEl;
+    }
+
+    return fallback;
+  }
+
+  function getRepeatingRowElementFromDom(sectionName, rowId, spellName = '') {
+    const rid = String(rowId || '').trim();
+    if (!rid && !spellName) return null;
+
+    const escRid = escapeAttrSelectorValue(rid);
+    const section = String(sectionName || '').trim();
+    if (section && rid) {
+      const escSection = escapeAttrSelectorValue(section);
+      const inSection =
+        document.querySelector(`.repcontainer[data-groupname="${escSection}"] .repitem[data-reprowid="${escRid}"]`) ||
+        document.querySelector(`.repcontainer[data-groupname="${escSection}"] [data-reprowid="${escRid}"]`) ||
+        document.querySelector(`.repcontainer[data-groupname="${escSection}"] [data-itemid="${escRid}"]`);
+      if (inSection instanceof Element) return inSection;
+    }
+
+    if (rid) {
+      const globalMatch =
+        document.querySelector(`.repitem[data-reprowid="${escRid}"]`) ||
+        document.querySelector(`[data-reprowid="${escRid}"]`) ||
+        document.querySelector(`[data-itemid="${escRid}"]`);
+      if (globalMatch instanceof Element) return globalMatch;
+    }
+
+    return findSpellRowElementByName(section, spellName, rid);
+  }
+
+  function getRepeatingRowFieldFromDom(sectionName, rowId, attrName, options = null) {
+    const rid = String(rowId || '').trim();
+    const name = String(attrName || '').trim();
+    if (!rid || !name) return '';
+
+    const opts = { preferDisplay: false, ...(options || {}) };
+    const escName = escapeAttrSelectorValue(name);
+
+    const rowEl = getRepeatingRowElementFromDom(sectionName, rid);
+    if (!(rowEl instanceof Element)) return '';
+
+    const pickValue = (controls) => {
+      let fallback = '';
+      for (const control of controls) {
+        const value = readFormControlCurrentValue(control);
+        if (!value) continue;
+        if (!fallback) fallback = value;
+        if (value !== '0') return value;
+      }
+      return fallback;
+    };
+
+    if (opts.preferDisplay) {
+      // For spell components, always prefer hidden values from the compact display header.
+      const compMatch = name.match(/^attr_spellcomp_([vsm])$/i);
+      if (compMatch) {
+        const letter = String(compMatch[1] || '').toLowerCase();
+        const displayHidden = rowEl.querySelector(`.display input.${letter}[name="${escName}"]`);
+        if (displayHidden) {
+          const displayValue = readFormControlCurrentValue(displayHidden);
+          if (displayValue) return displayValue;
+          return '0';
+        }
+      }
+
+      const displayControls = Array.from(
+        rowEl.querySelectorAll(`.display input[name="${escName}"], .display textarea[name="${escName}"], .display select[name="${escName}"]`)
+      );
+      if (displayControls.length) {
+        return pickValue(displayControls);
+      }
+    }
+
+    const allControls = Array.from(
+      rowEl.querySelectorAll(`input[name="${escName}"], textarea[name="${escName}"], select[name="${escName}"]`)
+    );
+    return pickValue(allControls);
+  }
+
+  function withSpellDomFieldOverrides(sectionName, rowId, fields) {
+    const merged = { ...(fields || {}) };
+    const overrides = [
+      ['spellcomp', getRepeatingRowFieldFromDom(sectionName, rowId, 'attr_spellcomp')],
+      ['spellcomp_v', getRepeatingRowFieldFromDom(sectionName, rowId, 'attr_spellcomp_v', { preferDisplay: true })],
+      ['spellcomp_s', getRepeatingRowFieldFromDom(sectionName, rowId, 'attr_spellcomp_s', { preferDisplay: true })],
+      ['spellcomp_m', getRepeatingRowFieldFromDom(sectionName, rowId, 'attr_spellcomp_m', { preferDisplay: true })],
+      ['spellconcentration', getRepeatingRowFieldFromDom(sectionName, rowId, 'attr_spellconcentration', { preferDisplay: true })],
+      ['spellcomp_materials', getRepeatingRowFieldFromDom(sectionName, rowId, 'attr_spellcomp_materials')],
+    ];
+
+    overrides.forEach(([key, value]) => {
+      if (value === '') return;
+      merged[key] = value;
+    });
+
+    return merged;
+  }
+
+  function readSpellRowStateFromDom(rowEl) {
+    if (!(rowEl instanceof Element)) return null;
+
+    const gatherControlsByName = (attrName, preferClass = '') => {
+      const escName = escapeAttrSelectorValue(attrName);
+      const cls = String(preferClass || '').trim();
+      const parts = [];
+      if (cls) {
+        parts.push(Array.from(rowEl.querySelectorAll(`.display input[type="hidden"].${cls}[name="${escName}"]`)));
+      }
+      parts.push(Array.from(rowEl.querySelectorAll(`.display input[type="hidden"][name="${escName}"]`)));
+      parts.push(Array.from(rowEl.querySelectorAll(`input[type="hidden"][name="${escName}"]`)));
+      if (cls) {
+        parts.push(Array.from(rowEl.querySelectorAll(`.display input.${cls}[name="${escName}"], .display textarea.${cls}[name="${escName}"], .display select.${cls}[name="${escName}"]`)));
+      }
+      parts.push(Array.from(rowEl.querySelectorAll(`.display input[name="${escName}"], .display textarea[name="${escName}"], .display select[name="${escName}"]`)));
+      parts.push(Array.from(rowEl.querySelectorAll(`input[name="${escName}"], textarea[name="${escName}"], select[name="${escName}"]`)));
+
+      const seen = new Set();
+      const merged = [];
+      parts.forEach((group) => {
+        group.forEach((ctrl) => {
+          if (seen.has(ctrl)) return;
+          seen.add(ctrl);
+          merged.push(ctrl);
+        });
+      });
+      return merged;
+    };
+
+    const pickRawNamedValue = (attrName, options = null) => {
+      const opts = { token: '', preferClass: '', ...(options || {}) };
+      const controls = gatherControlsByName(attrName, opts.preferClass);
+      if (!controls.length) return '';
+
+      const values = controls
+        .map((control) => readFormControlCurrentValue(control))
+        .map((v) => String(v || '').trim())
+        .filter(Boolean);
+      if (!values.length) return '';
+
+      if (opts.token) {
+        const recognized = values.find((raw) => isDisabledSpellFlagValue(raw) || isEnabledSpellFlagValue(raw, opts.token));
+        if (recognized) return recognized;
+      }
+      return values[0];
+    };
+
+    const vRaw = pickRawNamedValue('attr_spellcomp_v', { token: 'v', preferClass: 'v' });
+    const sRaw = pickRawNamedValue('attr_spellcomp_s', { token: 's', preferClass: 's' });
+    const mRaw = pickRawNamedValue('attr_spellcomp_m', { token: 'm', preferClass: 'm' });
+    const cRaw = pickRawNamedValue('attr_spellconcentration', { token: 'concentration', preferClass: 'spellconcentration' });
+    const rRaw = pickRawNamedValue('attr_spellritual', { token: 'ritual', preferClass: 'spellritual' });
+    const material = pickRawNamedValue('attr_spellcomp_materials');
+
+    const cConc = parseSpellFlagRaw(cRaw, 'concentration');
+    const cShort = parseSpellFlagRaw(cRaw, 'c');
+    const rRitual = parseSpellFlagRaw(rRaw, 'ritual');
+    const rShort = parseSpellFlagRaw(rRaw, 'r');
+    const componentFlags = {
+      v: parseSpellFlagRaw(vRaw, 'v'),
+      s: parseSpellFlagRaw(sRaw, 's'),
+      m: parseSpellFlagRaw(mRaw, 'm'),
+      c: cConc != null ? cConc : cShort,
+      r: rRitual != null ? rRitual : rShort,
+    };
+
+    return { componentFlags, material };
+  }
+
+  function getSpellDomRowStateMap(sectionName) {
+    const map = new Map();
+    const section = String(sectionName || '').trim();
+    if (!section) return map;
+
+    const escSection = escapeAttrSelectorValue(section);
+    const container = document.querySelector(`.repcontainer[data-groupname="${escSection}"]`);
+    if (!(container instanceof Element)) return map;
+
+    const rowElements = Array.from(container.querySelectorAll('.repitem[data-reprowid], .repitem[data-itemid]'));
+    rowElements.forEach((rowEl) => {
+      const rowId = String(rowEl.getAttribute('data-reprowid') || rowEl.getAttribute('data-itemid') || '').trim();
+      if (!rowId) return;
+      const state = readSpellRowStateFromDom(rowEl);
+      if (!state) return;
+      map.set(rowId, state);
+      map.set(rowId.toLowerCase(), state);
+    });
+
+    return map;
+  }
+
+  function getSpellDomRowState(map, rowId) {
+    if (!(map instanceof Map)) return null;
+    const rid = String(rowId || '').trim();
+    if (!rid) return null;
+    return map.get(rid) || map.get(rid.toLowerCase()) || null;
+  }
+
   function getSpellsState() {
     const char = getSelectedChar();
     if (!char) return { levels: [], selected: null, hasMemorized: false, filterMemOnly: false };
@@ -2676,13 +3008,15 @@
     sections.forEach((section) => {
       const level = parseIntSafe((section.match(/-(\d+)$/) || [])[1], 0);
       if (!byLevel.has(level)) byLevel.set(level, []);
+      const spellDomStateMap = getSpellDomRowStateMap(section);
 
       const rows = getRepeatingSectionRows(char, section);
       rows.forEach((row) => {
-        const name = pickRowFieldValue(row.fields, ['spellname', 'name']);
+        const spellFields = withSpellDomFieldOverrides(section, row.rowId, row.fields);
+        const name = pickRowFieldValue(spellFields, ['spellname', 'name']);
         if (!name) return;
 
-        const description = pickRowFieldValue(row.fields, [
+        const description = pickRowFieldValue(spellFields, [
           'spelldescription',
           'spell_description',
           'description',
@@ -2690,31 +3024,44 @@
           'content',
           'desc',
         ]);
-        const castingTime = pickRowFieldValue(row.fields, [
+        const castingTime = pickRowFieldValue(spellFields, [
           'spellcastingtime',
           'castingtime',
           'casting_time',
           'spellcasting_time',
         ]);
-        const range = pickRowFieldValue(row.fields, ['spellrange', 'range']);
-        const target = pickRowFieldValue(row.fields, [
+        const range = pickRowFieldValue(spellFields, ['spellrange', 'range']);
+        const target = pickRowFieldValue(spellFields, [
           'spelltarget',
           'target',
           'targets',
           'spell_target',
         ]);
-        const duration = pickRowFieldValue(row.fields, [
+        const duration = pickRowFieldValue(spellFields, [
           'spellduration',
           'duration',
           'spell_duration',
           'duration_text',
         ]);
-        const components = spellComponentsFromFields(row.fields);
+        const fieldComponentFlags = spellComponentFlagsFromFields(spellFields, duration);
+        const fieldMaterial = spellMaterialFromFields(spellFields);
+        const domRowState =
+          getSpellDomRowState(spellDomStateMap, row.rowId) ||
+          readSpellRowStateFromDom(getRepeatingRowElementFromDom(section, row.rowId, name));
+        const mergeFlag = (domFlag, fieldFlag) => (domFlag == null ? Boolean(fieldFlag) : Boolean(domFlag));
+        const componentFlags = {
+          v: mergeFlag(domRowState?.componentFlags?.v, fieldComponentFlags.v),
+          s: mergeFlag(domRowState?.componentFlags?.s, fieldComponentFlags.s),
+          m: mergeFlag(domRowState?.componentFlags?.m, fieldComponentFlags.m),
+          c: mergeFlag(domRowState?.componentFlags?.c, fieldComponentFlags.c),
+          r: mergeFlag(domRowState?.componentFlags?.r, fieldComponentFlags.r),
+        };
+        const material = domRowState?.material ? domRowState.material : fieldMaterial;
         const rollField =
-          pickRowFieldKey(row.fields, ['spell', 'rollspell', 'roll_spell', 'attack', 'roll']) ||
+          pickRowFieldKey(spellFields, ['spell', 'rollspell', 'roll_spell', 'attack', 'roll']) ||
           'spell';
         const rollAttr = `${section}_${row.rowId}_${rollField}`;
-        const preparedState = getSpellPreparedState(char, section, row.rowId, row.fields);
+        const preparedState = getSpellPreparedState(char, section, row.rowId, spellFields);
         const memorized = preparedState.memorized;
         if (memorized) hasMemorized = true;
 
@@ -2731,7 +3078,8 @@
           castingTime,
           range,
           target,
-          components,
+            material,
+          componentFlags,
           duration,
           summary: shortSummary(description, 120),
         });
@@ -2817,6 +3165,13 @@
                   const tooltip = escapeHtml(
                     spell.summary ? `${spell.name} : ${spell.summary}` : `Sort : ${spell.name}`
                   );
+                  const leftBadge = buildSpellBadgesHtml(spell.componentFlags, {
+                    v: false,
+                    s: false,
+                    m: false,
+                    c: true,
+                    r: true,
+                  });
                   return `
                     <div class="tm-spell-row ${spell.memorized ? 'is-memorized' : ''}" data-label="${tooltip}">
                       <input
@@ -2832,7 +3187,8 @@
                         data-spell-section="${escapeHtml(spell.section)}"
                         data-spell-rollattr="${escapeHtml(spell.rollAttr)}"
                         data-label="${tooltip}">
-                        ${escapeHtml(spell.name)}
+                        <span class="tm-spell-item-name">${escapeHtml(spell.name)}</span>
+                        ${leftBadge}
                       </button>
                     </div>
                   `;
@@ -2876,13 +3232,35 @@
 
     const selected = state.selected;
     const detailTitle = selected ? escapeHtml(selected.name) : 'Détail';
+    const selectedDomState = selected
+      ? readSpellRowStateFromDom(getRepeatingRowElementFromDom(selected.section, selected.rowId, selected.name))
+      : null;
+    const selectedFlags = selected
+      ? {
+          v: selectedDomState?.componentFlags?.v == null ? Boolean(selected.componentFlags?.v) : Boolean(selectedDomState.componentFlags.v),
+          s: selectedDomState?.componentFlags?.s == null ? Boolean(selected.componentFlags?.s) : Boolean(selectedDomState.componentFlags.s),
+          m: selectedDomState?.componentFlags?.m == null ? Boolean(selected.componentFlags?.m) : Boolean(selectedDomState.componentFlags.m),
+          c: selectedDomState?.componentFlags?.c == null ? Boolean(selected.componentFlags?.c) : Boolean(selectedDomState.componentFlags.c),
+          r: selectedDomState?.componentFlags?.r == null ? Boolean(selected.componentFlags?.r) : Boolean(selectedDomState.componentFlags.r),
+        }
+      : null;
+    const selectedMaterial = selected ? (selectedDomState?.material ? selectedDomState.material : selected.material) : '';
+    const detailBadges = selected
+      ? buildSpellBadgesHtml(selectedFlags, {
+          v: true,
+          s: true,
+          m: true,
+          c: false,
+          r: true,
+        })
+      : '';
     const detailMeta = selected
       ? `
         <div class="tm-spell-meta">
           <div><span class="tm-spell-key">Incantation :</span> ${escapeHtml(selected.castingTime || '—')}</div>
           <div><span class="tm-spell-key">Portée :</span> ${escapeHtml(selected.range || '—')}</div>
           <div><span class="tm-spell-key">Cible :</span> ${escapeHtml(selected.target || '—')}</div>
-          <div><span class="tm-spell-key">Composante :</span> ${escapeHtml(selected.components || '—')}</div>
+          <div><span class="tm-spell-key">Composante :</span> ${escapeHtml(selectedMaterial || '—')}</div>
           <div><span class="tm-spell-key">Durée :</span> ${escapeHtml(selected.duration || '—')}</div>
         </div>
       `
@@ -2898,7 +3276,10 @@
         </div>
         <div class="tm-hud-split-right">
           <div class="tm-detail-panel">
-            <div class="tm-detail-title">${detailTitle}</div>
+            <div class="tm-detail-head">
+              <div class="tm-detail-title">${detailTitle}</div>
+              ${detailBadges}
+            </div>
             ${detailMeta}
             <div class="tm-detail-body">${detailBody}</div>
           </div>
@@ -3576,6 +3957,10 @@
     .tm-spell-item{
       flex:1 1 auto;
       min-width:0;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:6px;
     }
 
     .tm-spell-item.is-memorized{
@@ -3585,6 +3970,65 @@
 
     .tm-spell-item.is-unmemorized{
       opacity:0.88;
+    }
+
+    .tm-detail-head{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:8px;
+    }
+
+    .tm-spell-item-name{
+      flex:1 1 auto;
+      min-width:0;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+
+    .tm-spell-badges{
+      display:flex;
+      align-items:center;
+      gap:4px;
+      flex:0 0 auto;
+    }
+
+    .tm-detail-head .tm-spell-badges{
+      margin-left:auto;
+    }
+
+    .tm-spell-badge{
+      width:16px;
+      height:16px;
+      border-radius:999px;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      color:#fff;
+      font-size:9px;
+      font-weight:700;
+      line-height:1;
+      border:1px solid rgba(255,255,255,0.2);
+      box-sizing:border-box;
+      text-shadow:0 1px 0 rgba(0,0,0,0.4);
+    }
+
+    .tm-detail-head .tm-spell-badge{
+      width:18px;
+      height:18px;
+      font-size:10px;
+    }
+
+    .tm-spell-badge-v{ background:#1f9e44; }
+    .tm-spell-badge-s{ background:#2f6dff; }
+    .tm-spell-badge-m{ background:#c66f00; }
+    .tm-spell-badge-c{ background:#c62828; }
+    .tm-spell-badge-r{
+      background:#cfd3d8;
+      color:#1f1f1f;
+      border-color:rgba(255,255,255,0.5);
+      text-shadow:none;
     }
 
     .tm-equip-item{
