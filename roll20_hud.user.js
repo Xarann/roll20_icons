@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Roll20 HUD
 // @namespace    http://tampermonkey.net/
-// @version      6.97
+// @version      7.05
 // @match        https://app.roll20.net/editor/
 // @grant        none
 // ==/UserScript==
@@ -22,10 +22,10 @@
   const TOOLTIP_OFFSET_Y = 24;
   const HUD_SHIFT_RIGHT_PERCENT = 15;
   const TRAIT_SOURCE_OPEN = Object.create(null);
-  const EQUIPMENT_CATEGORY_OPEN = Object.create(null);
   const SPELL_LEVEL_OPEN = Object.create(null);
   let SELECTED_TRAIT_KEY = '';
   let SELECTED_SPELL_KEY = '';
+  let SELECTED_EQUIPMENT_CATEGORY = '';
   let SPELL_SHOW_ALL = localStorage.getItem('tm_spell_show_all') === '1';
 
   /* ================= CHARACTER ================= */
@@ -161,6 +161,41 @@
     if (!text) return '';
     if (text.length <= maxLen) return text;
     return `${text.slice(0, Math.max(0, maxLen - 3)).trim()}...`;
+  }
+
+  function spellComponentsFromFields(fields) {
+    const direct = pickRowFieldValue(fields, [
+      'spellcomp',
+      'spellcomponents',
+      'components',
+      'spell_component',
+      'component',
+    ]);
+    if (direct) return direct;
+
+    const yes = (name) => {
+      const v = String(fields?.[name] || '').trim();
+      return isExplicitYesValue(v);
+    };
+
+    const parts = [];
+    if (yes('spellcomp_v') || yes('spellcompverbal') || yes('verbal')) parts.push('V');
+    if (yes('spellcomp_s') || yes('spellcompsomatic') || yes('somatic')) parts.push('S');
+    if (yes('spellcomp_m') || yes('spellcompmaterial') || yes('material')) parts.push('M');
+
+    const material = pickRowFieldValue(fields, [
+      'spellcomp_materials',
+      'spellcompmaterials',
+      'materials',
+      'material',
+      'spell_material',
+    ]);
+    if (material) {
+      if (!parts.includes('M')) parts.push('M');
+      return `${parts.join(', ')} (${material})`;
+    }
+
+    return parts.join(', ');
   }
 
   function button(cmd) {
@@ -795,18 +830,30 @@
   }
 
   function isLikelyResourceBase(base) {
-    const b = String(base || '').trim();
+    const b = normalizeResourceBaseKey(base);
     if (!b || !/resource/i.test(b)) return false;
-    if (/^repeating_/i.test(b)) return false;
     if (
-      /(?:_|^)(?:name|max|reset|recharge|recovery|recover|rest|refresh|uses|enabled|active|flag|mod|type)$/i.test(
+      /(?:_|^)(?:name|max|total|maximum|current|value|count|qty|amount|reset|recharge|recovery|recover|rest|refresh|uses|enabled|active|flag|mod|type)$/i.test(
         b
       )
     ) return false;
     return true;
   }
 
+  const RESOURCE_VALUE_TOKENS = [
+    'value',
+    'current',
+    'uses',
+    'qty',
+    'count',
+    'amount',
+  ];
+
+  const RESOURCE_MAX_TOKENS = ['max', 'total', 'maximum'];
+
   const RESOURCE_META_TOKENS = [
+    ...RESOURCE_VALUE_TOKENS,
+    ...RESOURCE_MAX_TOKENS,
     'recovery_period',
     'uses_recovery',
     'uses_reset',
@@ -819,7 +866,6 @@
     'reset',
     'rest',
     'name',
-    'max',
     'short',
     'long',
     'sr',
@@ -828,6 +874,14 @@
 
   function escapeRegExp(value) {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function normalizeResourceBaseKey(base) {
+    const raw = String(base || '').trim();
+    if (!raw) return '';
+    return raw
+      .replace(/((?:^|_)resource)_?(\d+)$/i, '$1_$2')
+      .replace(/_{2,}/g, '_');
   }
 
   function parseResourceAttrParts(attrName) {
@@ -839,19 +893,29 @@
 
       let m = name.match(new RegExp(`^(.*)_${tokenRx}$`, 'i'));
       if (m && isLikelyResourceBase(m[1])) {
-        return { base: m[1], token, attr: name };
+        return { base: normalizeResourceBaseKey(m[1]), token, attr: name };
       }
 
       m = name.match(new RegExp(`^(.*)_${tokenRx}_(.+)$`, 'i'));
       if (m) {
         const candidate = `${m[1]}_${m[2]}`;
         if (isLikelyResourceBase(candidate)) {
-          return { base: candidate, token, attr: name };
+          return { base: normalizeResourceBaseKey(candidate), token, attr: name };
+        }
+      }
+
+      m = name.match(new RegExp(`^(.*)_${tokenRx}(\\d+)$`, 'i'));
+      if (m) {
+        const candidate = `${m[1]}_${m[2]}`;
+        if (isLikelyResourceBase(candidate)) {
+          return { base: normalizeResourceBaseKey(candidate), token, attr: name };
         }
       }
     }
 
-    if (isLikelyResourceBase(name)) return { base: name, token: 'value', attr: name };
+    if (isLikelyResourceBase(name)) {
+      return { base: normalizeResourceBaseKey(name), token: 'value', attr: name };
+    }
     return null;
   }
 
@@ -894,20 +958,28 @@
     const defMap = new Map();
 
     function ensureDef(base) {
-      if (!defMap.has(base)) {
-        defMap.set(base, {
-          key: base,
-          fallbackName: makeResourceFallbackName(base),
-          valueAttr: base,
-          maxAttr: `${base}_max`,
-          nameAttr: `${base}_name`,
+      const normalized = normalizeResourceBaseKey(base);
+      if (!normalized) return null;
+      if (!defMap.has(normalized)) {
+        defMap.set(normalized, {
+          key: normalized,
+          fallbackName: makeResourceFallbackName(normalized),
+          valueAttr: normalized,
+          maxAttr: `${normalized}_max`,
+          nameAttr: `${normalized}_name`,
         });
       }
-      return defMap.get(base);
+      return defMap.get(normalized);
     }
 
     ensureDef('class_resource');
     ensureDef('other_resource');
+
+    names.forEach((name) => {
+      const m = name.match(/^(class_resource|other_resource)_?(\d+)(?:_|$)/i);
+      if (!m) return;
+      ensureDef(`${m[1]}_${m[2]}`);
+    });
 
     names.forEach((name) => {
       const parsed = parseResourceAttrParts(name);
@@ -915,8 +987,38 @@
 
       const def = ensureDef(parsed.base);
       if (parsed.token === 'name') def.nameAttr = name;
-      if (parsed.token === 'max') def.maxAttr = name;
-      if (parsed.token === 'value') def.valueAttr = name;
+      if (RESOURCE_MAX_TOKENS.includes(parsed.token)) def.maxAttr = name;
+      if (RESOURCE_VALUE_TOKENS.includes(parsed.token)) def.valueAttr = name;
+    });
+
+    // Explicit support for DD5e Legacy repeating_resource left/right rows.
+    names.forEach((name) => {
+      const m = name.match(/^repeating_resource_([^_]+)_resource_(left|right)(?:_(.+))?$/i);
+      if (!m) return;
+      const rowId = m[1];
+      const side = m[2].toLowerCase();
+      const field = String(m[3] || '').toLowerCase();
+      const def = ensureDef(`repeating_resource_${rowId}_resource_${side}`);
+      if (!def) return;
+
+      if (!field) {
+        def.valueAttr = name;
+        return;
+      }
+
+      if (field === 'name') {
+        def.nameAttr = name;
+        return;
+      }
+
+      if (RESOURCE_MAX_TOKENS.includes(field)) {
+        def.maxAttr = name;
+        return;
+      }
+
+      if (RESOURCE_VALUE_TOKENS.includes(field) || field === side) {
+        def.valueAttr = name;
+      }
     });
 
     return Array.from(defMap.values())
@@ -997,38 +1099,100 @@
     if (!char) return [];
 
     const defs = discoverResourceDefs(char);
+    const items = [];
 
-    return defs
-      .map((def) => {
-        const valueRaw = getAttrCurrentValue(char, def.valueAttr);
-        const maxRaw = getAttrCurrentValue(char, def.maxAttr);
-        const nameRaw = getAttrCurrentValue(char, def.nameAttr);
-        if (!nameRaw) return null;
-        const value = formatHpValue(valueRaw);
-        const max = formatHpValue(maxRaw);
+    defs.forEach((def) => {
+      const valueRaw = getAttrCurrentValue(char, def.valueAttr);
+      const maxRaw = getAttrCurrentValue(char, def.maxAttr);
+      const nameRaw = getAttrCurrentValue(char, def.nameAttr);
+      if (!nameRaw) return;
 
-        const hasAny = Boolean(
-          valueRaw ||
-            maxRaw ||
-            getCharAttrModel(char, def.valueAttr) ||
-            getCharAttrModel(char, def.maxAttr)
-        );
-        if (!hasAny) return null;
+      const sortMeta = getResourceSortMeta(def.key);
+      items.push({
+        key: def.key,
+        label: nameRaw,
+        value: valueRaw ? formatHpValue(valueRaw) : '0',
+        max: formatHpValue(maxRaw),
+        valueAttr: def.valueAttr,
+        maxAttr: def.maxAttr,
+        resetType: detectResourceResetType(char, def.key),
+        sortRank: sortMeta.group * 1000 + sortMeta.index,
+      });
+    });
 
-        const label = nameRaw;
-        const resetType = detectResourceResetType(char, def.key);
+    // Explicit pass for DD5e repeating_resource rows (left/right blocks).
+    const repRows = getRepeatingSectionRows(char, 'repeating_resource');
+    repRows.forEach((row, rowIndex) => {
+      ['left', 'right'].forEach((side, sideIndex) => {
+        const nameField =
+          pickRowFieldKey(row.fields, [
+            `resource_${side}_name`,
+            `${side}_name`,
+            `resource${side}_name`,
+          ]) || '';
+        const valueField =
+          pickRowFieldKey(row.fields, [
+            `resource_${side}`,
+            `${side}`,
+            `resource${side}`,
+          ]) || `resource_${side}`;
+        const maxField =
+          pickRowFieldKey(row.fields, [
+            `resource_${side}_max`,
+            `${side}_max`,
+            `resource_${side}_total`,
+            `${side}_total`,
+            `resource${side}_max`,
+          ]) || '';
+        const resetField =
+          pickRowFieldKey(row.fields, [
+            `resource_${side}_reset`,
+            `${side}_reset`,
+            `resource_${side}_recovery`,
+            `${side}_recovery`,
+            `resource_${side}_recharge`,
+            `${side}_recharge`,
+          ]) || '';
 
-        return {
-          key: def.key,
+        const label = String(nameField ? row.fields[nameField] : '').trim();
+        if (!label) return;
+
+        const valueRaw = String(valueField ? row.fields[valueField] : '').trim();
+        const maxRaw = String(maxField ? row.fields[maxField] : '').trim();
+        const resetRaw = String(resetField ? row.fields[resetField] : '').trim();
+        const resetPrefix = `repeating_resource_${row.rowId}_resource_${side}`;
+
+        items.push({
+          key: `${resetPrefix}_item`,
           label,
-          value,
-          max,
-          valueAttr: def.valueAttr,
-          maxAttr: def.maxAttr,
-          resetType,
-        };
-      })
-      .filter(Boolean);
+          value: valueRaw ? formatHpValue(valueRaw) : '0',
+          max: formatHpValue(maxRaw),
+          valueAttr: `repeating_resource_${row.rowId}_${valueField}`,
+          maxAttr: maxField ? `repeating_resource_${row.rowId}_${maxField}` : '',
+          resetType: inferResetTypeFromText(resetRaw) || detectResourceResetType(char, resetPrefix),
+          sortRank: 5000 + rowIndex * 2 + sideIndex,
+        });
+      });
+    });
+
+    const dedupByValueAttr = new Map();
+    items.forEach((item) => {
+      const key = item.valueAttr || item.key;
+      if (!key) return;
+      dedupByValueAttr.set(key, item);
+    });
+
+    return Array.from(dedupByValueAttr.values())
+      .sort((a, b) => (a.sortRank || 999999) - (b.sortRank || 999999))
+      .map((item) => ({
+        key: item.key,
+        label: item.label,
+        value: item.value,
+        max: item.max,
+        valueAttr: item.valueAttr,
+        maxAttr: item.maxAttr,
+        resetType: item.resetType,
+      }));
   }
 
   const CURRENCY_FIELDS = [
@@ -2032,7 +2196,7 @@
 
   function getEquipmentState() {
     const char = getSelectedChar();
-    if (!char) return [];
+    if (!char) return { groups: [], selected: null };
 
     const rows = getRepeatingSectionRows(char, 'repeating_inventory');
     const groups = new Map();
@@ -2079,18 +2243,25 @@
       .map(([category, items]) => ({ category, items }))
       .filter((group) => group.items.length > 0);
 
-    result.forEach((group, idx) => {
-      if (typeof EQUIPMENT_CATEGORY_OPEN[group.category] !== 'boolean') {
-        EQUIPMENT_CATEGORY_OPEN[group.category] = idx === 0;
-      }
-    });
+    if (!result.length) {
+      SELECTED_EQUIPMENT_CATEGORY = '';
+      return { groups: [], selected: null };
+    }
 
-    return result;
+    const hasSelection = result.some((group) => group.category === SELECTED_EQUIPMENT_CATEGORY);
+    if (!hasSelection) {
+      SELECTED_EQUIPMENT_CATEGORY = result[0].category;
+    }
+
+    const selected =
+      result.find((group) => group.category === SELECTED_EQUIPMENT_CATEGORY) || result[0];
+
+    return { groups: result, selected };
   }
 
   function buildEquipmentContent() {
-    const groups = getEquipmentState();
-    if (!groups.length) {
+    const state = getEquipmentState();
+    if (!state.groups.length) {
       return `
         <div class="tm-hud-wrap">
           <div class="tm-mod-title">Équipement</div>
@@ -2099,50 +2270,57 @@
       `;
     }
 
-    const groupsHtml = groups
+    const categoriesHtml = state.groups
       .map((group) => {
-        const isOpen = Boolean(EQUIPMENT_CATEGORY_OPEN[group.category]);
-        const marker = isOpen ? 'v' : '>';
-
-        const itemsHtml = isOpen
-          ? `
-            <div class="tm-fold-list">
-              ${group.items
-                .map((item) => {
-                  const tooltip = escapeHtml(`Objet : ${item.name}`);
-                  return `
-                    <label class="tm-equip-item" data-label="${tooltip}">
-                      <input
-                        type="checkbox"
-                        data-equip-attr="${escapeHtml(item.equipAttr)}"
-                        ${item.equipped ? 'checked' : ''}>
-                      <span class="tm-equip-name">${escapeHtml(item.name)}</span>
-                    </label>
-                  `;
-                })
-                .join('')}
-            </div>
-          `
-          : '';
+        const isActive = state.selected?.category === group.category;
+        const activeClass = isActive ? ' is-active' : '';
+        const tooltip = escapeHtml(`Catégorie : ${group.category} (${group.items.length})`);
 
         return `
-          <div class="tm-fold-block tm-fold-up">
-            ${itemsHtml}
-            <button
-              class="tm-fold-toggle"
-              data-equip-category="${escapeHtml(group.category)}"
-              data-label="Catégorie : ${escapeHtml(group.category)}">
-              ${escapeHtml(group.category)} ${marker}
-            </button>
-          </div>
+          <button
+            class="tm-fold-toggle tm-equip-category-btn${activeClass}"
+            data-equip-category="${escapeHtml(group.category)}"
+            data-label="${tooltip}">
+            ${escapeHtml(group.category)} (${group.items.length})
+          </button>
         `;
       })
       .join('');
 
+    const selected = state.selected;
+    const selectedTitle = selected ? escapeHtml(selected.category) : 'Aucune catégorie';
+    const itemsHtml = selected?.items?.length
+      ? selected.items
+          .map((item) => {
+            const tooltip = escapeHtml(`Objet : ${item.name}`);
+            return `
+              <label class="tm-equip-item" data-label="${tooltip}">
+                <input
+                  type="checkbox"
+                  data-equip-attr="${escapeHtml(item.equipAttr)}"
+                  ${item.equipped ? 'checked' : ''}>
+                <span class="tm-equip-name">${escapeHtml(item.name)}</span>
+              </label>
+            `;
+          })
+          .join('')
+      : '<div class="tm-mod-empty">Aucun item dans cette catégorie</div>';
+
     return `
-      <div class="tm-hud-wrap">
-        <div class="tm-mod-title">Équipement</div>
-        ${groupsHtml}
+      <div class="tm-hud-wrap tm-hud-wrap-split">
+        <div class="tm-hud-split-left">
+          <div class="tm-mod-title">Équipement</div>
+          <div class="tm-fold-block tm-fold-up">
+            <div class="tm-fold-toggle tm-equip-static-toggle">Catégories</div>
+            <div class="tm-fold-list tm-equip-cat-list">${categoriesHtml}</div>
+          </div>
+        </div>
+        <div class="tm-hud-split-right">
+          <div class="tm-detail-panel tm-equip-detail-panel">
+            <div class="tm-detail-title">${selectedTitle}</div>
+            <div class="tm-fold-list tm-equip-detail-list">${itemsHtml}</div>
+          </div>
+        </div>
       </div>
     `;
   }
@@ -2516,8 +2694,22 @@
           'spellcastingtime',
           'castingtime',
           'casting_time',
+          'spellcasting_time',
         ]);
         const range = pickRowFieldValue(row.fields, ['spellrange', 'range']);
+        const target = pickRowFieldValue(row.fields, [
+          'spelltarget',
+          'target',
+          'targets',
+          'spell_target',
+        ]);
+        const duration = pickRowFieldValue(row.fields, [
+          'spellduration',
+          'duration',
+          'spell_duration',
+          'duration_text',
+        ]);
+        const components = spellComponentsFromFields(row.fields);
         const rollField =
           pickRowFieldKey(row.fields, ['spell', 'rollspell', 'roll_spell', 'attack', 'roll']) ||
           'spell';
@@ -2538,6 +2730,9 @@
           description,
           castingTime,
           range,
+          target,
+          components,
+          duration,
           summary: shortSummary(description, 120),
         });
       });
@@ -2684,12 +2879,11 @@
     const detailMeta = selected
       ? `
         <div class="tm-spell-meta">
-          ${
-            selected.castingTime
-              ? `<div><span class="tm-spell-key">Incantation :</span> ${escapeHtml(selected.castingTime)}</div>`
-              : ''
-          }
-          ${selected.range ? `<div><span class="tm-spell-key">Portée :</span> ${escapeHtml(selected.range)}</div>` : ''}
+          <div><span class="tm-spell-key">Incantation :</span> ${escapeHtml(selected.castingTime || '—')}</div>
+          <div><span class="tm-spell-key">Portée :</span> ${escapeHtml(selected.range || '—')}</div>
+          <div><span class="tm-spell-key">Cible :</span> ${escapeHtml(selected.target || '—')}</div>
+          <div><span class="tm-spell-key">Composante :</span> ${escapeHtml(selected.components || '—')}</div>
+          <div><span class="tm-spell-key">Durée :</span> ${escapeHtml(selected.duration || '—')}</div>
         </div>
       `
       : '';
@@ -2831,19 +3025,19 @@
       </div>
       <div id="tm-right-big-wrap">
         <div id="tm-left-col">
-          <div class="toggle" data-sec="skill" data-label="Compétences"><img src="${icon('skill')}"><span>Skill</span></div>
-          <div class="toggle" data-sec="jds" data-label="Jets de sauvegarde"><img src="${icon('JDS')}"><span>JDS</span></div>
-          <div class="toggle" data-sec="attr" data-label="Attributs"><img src="${icon('attribut')}"><span>Attributs</span></div>
+          <div class="toggle" data-sec="skill" data-label="Compétences"><img src="${icon('Skills')}"></div>
+          <div class="toggle" data-sec="jds" data-label="Jet de Sauvegarde"><img src="${icon('Saves')}"></div>
+          <div class="toggle" data-sec="attr" data-label="Attribut"><img src="${icon('Attributs')}"></div>
         </div>
         <div id="tm-mid-col">
-          <div class="toggle" data-sec="combat" data-label="Combat"><img src="${icon('weapons')}"><span>Combats</span></div>
-          <div class="toggle" data-sec="resource" data-label="Ressources"><span>Ressources</span></div>
-          <div class="toggle" data-sec="mods" data-label="Modificateurs globaux"><span>Mods</span></div>
+          <div class="toggle" data-sec="resource" data-label="Ressources"><img src="${icon('Ressources')}"></div>
+          <div class="toggle" data-sec="traits" data-label="Capacité et dons Raciaux"><img src="${icon('Capacity')}"></div>
+          <div class="toggle" data-sec="equipment" data-label="Equipement"><img src="${icon('Equipements')}"></div>
         </div>
         <div id="tm-extra-col">
-          <div class="toggle" data-sec="spells" data-label="Sorts"><span>Sorts</span></div>
-          <div class="toggle" data-sec="traits" data-label="Capacités"><span>Capacités</span></div>
-          <div class="toggle" data-sec="equipment" data-label="Équipement"><span>Équipement</span></div>
+          <div class="toggle" data-sec="combat" data-label="Combats"><img src="${icon('Fight')}"></div>
+          <div class="toggle" data-sec="spells" data-label="Sorts"><img src="${icon('Spells')}"></div>
+          <div class="toggle" data-sec="mods" data-label="Modificateurs Globaux"><img src="${icon('Mods')}"></div>
         </div>
       </div>
       <div id="tm-popup-zone" data-label="Zone accordéon"></div>
@@ -2866,8 +3060,9 @@
       --tm-accordion-width:140px;
       --tm-popup-zone-width:calc(var(--tm-accordion-width) * 3);
       --tm-accordion-wide-width:calc(var(--tm-accordion-width) * 1.2);
+      --tm-accordion-resource-width:calc(var(--tm-accordion-wide-width) * 1.15);
       --tm-accordion-xwide-width:calc(var(--tm-accordion-width) * 2.1);
-      --tm-main-toggle-width:calc(var(--tm-accordion-width) * 0.9);
+      --tm-main-toggle-width:40px;
       --tm-cell-size:40px;
       --tm-cell-gap:4px;
       position:fixed;
@@ -2914,6 +3109,7 @@
       color:#fff;
       cursor:pointer;
       box-sizing:border-box;
+      padding:0;
     }
 
     .toggle.icon-only{
@@ -3064,6 +3260,11 @@
       width:var(--tm-accordion-wide-width);
     }
 
+    .tm-popup.tm-popup-resource.is-wide .tm-mods-wrap,
+    .tm-popup.tm-popup-resource.is-wide .tm-mod-cat{
+      width:var(--tm-accordion-resource-width);
+    }
+
     .tm-popup.is-xwide .tm-cell-wide{
       width:var(--tm-accordion-xwide-width);
     }
@@ -3190,6 +3391,30 @@
     .tm-list-item.is-active{
       background:rgba(28,130,58,0.28);
       outline:1px solid rgba(126,255,170,0.55);
+    }
+
+    .tm-fold-toggle.is-active{
+      background:rgba(28,130,58,0.28);
+      outline:1px solid rgba(126,255,170,0.55);
+    }
+
+    .tm-equip-static-toggle{
+      cursor:default;
+      opacity:0.9;
+    }
+
+    .tm-equip-cat-list{
+      max-height:260px;
+    }
+
+    .tm-equip-detail-panel{
+      gap:6px;
+    }
+
+    .tm-equip-detail-list{
+      max-height:300px;
+      overflow:auto;
+      padding-right:2px;
     }
 
     .tm-fold-toggle.tm-trait-classe,
@@ -3732,11 +3957,11 @@
       popup.classList.add('is-wide', 'tm-popup-currency');
       el.appendChild(popup);
     } else {
-      if (sec === 'spells' || sec === 'traits') {
+      if (sec === 'spells' || sec === 'traits' || sec === 'equipment') {
         popup.classList.add('is-xwide', 'is-detail-right');
-      } else if (sec === 'equipment') {
-        popup.classList.add('is-xwide');
-      } else if (sec === 'combat' || sec === 'resource' || sec === 'mods') {
+      } else if (sec === 'resource') {
+        popup.classList.add('is-wide', 'tm-popup-resource');
+      } else if (sec === 'combat' || sec === 'mods') {
         popup.classList.add('is-wide');
       }
       (popupHost || el).appendChild(popup);
@@ -3816,7 +4041,7 @@
 
       if (btn.dataset.equipCategory) {
         const key = btn.dataset.equipCategory;
-        EQUIPMENT_CATEGORY_OPEN[key] = !EQUIPMENT_CATEGORY_OPEN[key];
+        SELECTED_EQUIPMENT_CATEGORY = key;
         if (currentSection === 'equipment' && currentPopup) {
           currentPopup.innerHTML = buildEquipmentContent();
         }
