@@ -29,6 +29,8 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
   let SELECTED_SPELL_KEY = '';
   let SELECTED_EQUIPMENT_CATEGORY = '';
   let SPELL_SHOW_ALL = localStorage.getItem('tm_spell_show_all') === '1';
+  const PREFETCHED_CHAR_IDS = new Set();
+  const PREFETCH_PENDING_CHAR_IDS = new Set();
 
 /* ================= CHARACTER ================= */
 
@@ -98,6 +100,61 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
     return LOCKED_CHAR;
   }
 
+  function getCharacterAttrCount(char) {
+    const models = char?.attribs?.models;
+    return Array.isArray(models) ? models.length : 0;
+  }
+
+  function markCharacterPrefetched(char) {
+    const id = getCharacterId(char);
+    if (!id) return;
+    PREFETCH_PENDING_CHAR_IDS.delete(id);
+    if (getCharacterAttrCount(char) > 0) {
+      PREFETCHED_CHAR_IDS.add(id);
+    }
+  }
+
+  function prefetchCharacterAttributes(char, onLoaded = null) {
+    const id = getCharacterId(char);
+    if (!id) return;
+
+    if (getCharacterAttrCount(char) > 0 || PREFETCHED_CHAR_IDS.has(id)) {
+      markCharacterPrefetched(char);
+      if (typeof onLoaded === 'function') onLoaded();
+      return;
+    }
+
+    if (PREFETCH_PENDING_CHAR_IDS.has(id)) return;
+
+    const collection = char?.attribs;
+    const fetchFn = collection?.fetch;
+    if (typeof fetchFn !== 'function') {
+      if (typeof onLoaded === 'function') onLoaded();
+      return;
+    }
+
+    PREFETCH_PENDING_CHAR_IDS.add(id);
+
+    try {
+      fetchFn.call(collection, {
+        success: () => {
+          markCharacterPrefetched(char);
+          if (typeof onLoaded === 'function') onLoaded();
+        },
+        error: () => {
+          PREFETCH_PENDING_CHAR_IDS.delete(id);
+        },
+      });
+    } catch (_error) {
+      PREFETCH_PENDING_CHAR_IDS.delete(id);
+    }
+  }
+
+  function prefetchAvailableCharacterAttributes() {
+    const chars = getAvailableCharacters();
+    chars.forEach((char) => prefetchCharacterAttributes(char));
+  }
+
   function updateCharacterSwitchButton() {
     if (!root) return;
 
@@ -117,12 +174,14 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
     toggle.setAttribute('aria-label', tooltip);
   }
 
-  function refreshHudAfterCharacterSwitch() {
+  function refreshHudForCurrentCharacter(resetSelections = false) {
     updateCharacterSwitchButton();
 
-    SELECTED_TRAIT_KEY = '';
-    SELECTED_SPELL_KEY = '';
-    SELECTED_EQUIPMENT_CATEGORY = '';
+    if (resetSelections) {
+      SELECTED_TRAIT_KEY = '';
+      SELECTED_SPELL_KEY = '';
+      SELECTED_EQUIPMENT_CATEGORY = '';
+    }
 
     renderHpState();
     syncGlobalMasterFlags();
@@ -142,6 +201,10 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
     if (anchor) open(sec, anchor);
   }
 
+  function refreshHudAfterCharacterSwitch() {
+    refreshHudForCurrentCharacter(true);
+  }
+
   function switchHudCharacter(step = 1) {
     const chars = getAvailableCharacters();
     if (!chars.length) {
@@ -158,6 +221,11 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
 
     LOCKED_CHAR = chars[nextIndex];
     refreshHudAfterCharacterSwitch();
+    const selected = LOCKED_CHAR;
+    prefetchCharacterAttributes(selected, () => {
+      if (getCharacterId(getSelectedChar()) !== getCharacterId(selected)) return;
+      refreshHudForCurrentCharacter(false);
+    });
   }
 
   function selectHudCharacterById(charId) {
@@ -172,6 +240,11 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
 
     LOCKED_CHAR = found;
     refreshHudAfterCharacterSwitch();
+    const selected = LOCKED_CHAR;
+    prefetchCharacterAttributes(selected, () => {
+      if (getCharacterId(getSelectedChar()) !== getCharacterId(selected)) return;
+      refreshHudForCurrentCharacter(false);
+    });
     return true;
   }
 
@@ -4869,6 +4942,10 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
 
 /* ================= INIT ================= */
 
+  prefetchAvailableCharacterAttributes();
+  prefetchCharacterAttributes(getSelectedChar(), () => {
+    refreshHudForCurrentCharacter(false);
+  });
   updateCharacterSwitchButton();
   renderHpState();
   syncGlobalMasterFlags();
@@ -4876,6 +4953,7 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
   setRollMode(detectRollMode(), false);
   setTimeout(syncRollModeFromSheet, 1000);
   setInterval(() => {
+    prefetchAvailableCharacterAttributes();
     updateCharacterSwitchButton();
     renderHpState();
     syncGlobalMasterFlags();
