@@ -47,10 +47,10 @@ This HUD puts key actions directly on the map to reduce clicks and speed up play
 ![Mods](screenshot7.png)
 
 ### Equipement
-![Mods](screenshot8.png)
+![Equipement](screenshot8.png)
 
 ### Spells
-![Mods](screenshot9.png)
+![Spells](screenshot9.png)
 ---
 
 ## ✨ Features
@@ -170,10 +170,11 @@ Ce HUD place les actions clés directement sur la map pour réduire les clics et
 ![Mods](screenshot7.png)
 
 ### Equipement
-![Mods](screenshot8.png)
+![Equipement](screenshot8.png)
 
 ### Sorts
-![Mods](screenshot9.png)
+![Spells](screenshot9.png)
+
 ---
 
 ## ✨ Fonctionnalités
