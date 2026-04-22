@@ -93,8 +93,7 @@ This HUD puts key actions directly on the map to reduce clicks and speed up play
 ## 🚀 Installation
 
 1. Install Tampermonkey.
-2. Install the userscript:
-   `https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/roll20_hud.user.js`
+2. Install script: 👉 https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/roll20_hud.user.js
 3. Reload Roll20.
 
 ---
@@ -217,8 +216,7 @@ Ce HUD place les actions clés directement sur la map pour réduire les clics et
 ## 🚀 Installation
 
 1. Installer Tampermonkey.
-2. Installer le userscript :
-   `https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/roll20_hud.user.js`
+2. Installer script: 👉 https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/roll20_hud.user.js
 3. Recharger Roll20.
 
 ---
