@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Roll20 HUD Next (Full)
 // @namespace    http://tampermonkey.net/
-// @version      8.07
+// @version      8.08
 // @match        https://app.roll20.net/editor/
 // @grant        none
 // ==/UserScript==
@@ -5834,6 +5834,7 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
       --tm-main-toggle-width:40px;
       --tm-cell-size:40px;
       --tm-cell-gap:4px;
+      --tm-bar-gap:8px;
       position:fixed;
       bottom:40px;
       left:50%;
@@ -5841,7 +5842,7 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
       z-index:9999999;
     }
 
-    #tm-bar{display:flex;gap:8px;align-items:flex-end}
+    #tm-bar{display:flex;gap:var(--tm-bar-gap);align-items:flex-end}
 
     #tm-left-tools{
       display:flex;
@@ -5971,7 +5972,7 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
     #tm-root.tm-mode-mj #tm-selected-token-debug{
       display:flex;
       width:calc((var(--tm-cell-size) * 3) + (var(--tm-cell-gap) * 2));
-      margin-left:calc((var(--tm-cell-size) + var(--tm-cell-gap)) * -1);
+      margin-left:calc((var(--tm-cell-size) + var(--tm-bar-gap)) * -1);
     }
 
     #tm-popup-zone{
@@ -7264,6 +7265,47 @@ const BASE = 'https://raw.githubusercontent.com/Xarann/Roll20_HUD/main/icons/';
 
   window.addEventListener('pointercancel', (e) => {
     stopHudDrag(e);
+  });
+
+  function applyLeftCtrlEasterEggTooltips(enabled) {
+    if (!root) return;
+
+    const setLabel = (selector, easterLabel) => {
+      const el = root.querySelector(selector);
+      if (!el) return;
+
+      const currentLabel = String(el.dataset.label || '').trim();
+      if (!Object.prototype.hasOwnProperty.call(el.dataset, 'tmBaseLabel')) {
+        el.dataset.tmBaseLabel = currentLabel;
+      }
+
+      const baseLabel = String(el.dataset.tmBaseLabel || '');
+      const nextLabel = enabled ? easterLabel : baseLabel;
+      el.dataset.label = nextLabel;
+      el.setAttribute('data-label', nextLabel);
+    };
+
+    setLabel('.toggle[data-sec="currency"]', "Enculé de Banquier ;)");
+    setLabel('.toggle[data-sec="combat"]', "A toi qui n'épargne personne");
+    setLabel('.toggle[data-sec="skill"]', "Pour le roi de l'optimisation burlesque");
+    setLabel('.toggle[data-sec="jds"]', "le gentil devant l'éternel");
+    setLabel('button[data-cmd="death"]', "Mille et une facon de faire souffrir ses PJ)");
+
+    hideTooltip();
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code !== 'ControlLeft') return;
+    applyLeftCtrlEasterEggTooltips(true);
+  });
+
+  window.addEventListener('keyup', (e) => {
+    if (e.code !== 'ControlLeft') return;
+    applyLeftCtrlEasterEggTooltips(false);
+  });
+
+  window.addEventListener('blur', () => {
+    applyLeftCtrlEasterEggTooltips(false);
   });
 
   root.addEventListener('click', (e) => {
